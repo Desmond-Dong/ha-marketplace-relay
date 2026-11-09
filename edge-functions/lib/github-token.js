@@ -1,12 +1,16 @@
 // Shared GitHub token fetch & cache / GitHub 共享 token 获取与缓存
 // Edge Functions shared module / Edge Functions 共享模块
 //
-// Source / 来源: HACS China tokenhub shared pool / HACS China tokenhub 共享池
+// Primary source / 主源: this project's own KV pool (namespace `marketplace`,
+// see lib/kv-pool.js) — tokens shared by page visitors via the Device Flow.
+// Fallback source / 回退源: HACS China tokenhub shared pool
 //   https://tokenhub.hacs.vip/api/token/get
 //
 // isolate-level memory cache for 30 minutes; a rejected token is dropped immediately
 // and the next request fetches a fresh one (the pool rotates many tokens).
 // isolate 内存缓存 30 分钟；token 被拒立即作废，下个请求换新的（池内多 token 轮换）。
+
+import { poolKv, nowStr, pickTokenRecord } from './kv-pool.js';
 
 export const TOKENHUB_API = 'https://tokenhub.hacs.vip/api/token/get';
 
@@ -17,7 +21,10 @@ const TOKEN_CACHE_TTL_MS = 30 * 60 * 1000;
 const RETRY_COOLDOWN_MS = 10 * 1000;
 
 // isolate-level cache (globals live as long as the isolate) / isolate 级缓存（全局变量随 isolate 存活）
-const tokenCache = { token: null, fetchedAt: 0, rejectedAt: 0 };
+// poolKey remembers which pool record the cached token came from, so a rejection can
+// prune/refresh that exact record in KV. / poolKey 记录缓存 token 来自哪条池记录，
+// 被拒时可以精准回写那条 KV 记录。
+const tokenCache = { token: null, fetchedAt: 0, rejectedAt: 0, poolKey: null };
 
 function markRejected() {
   tokenCache.token = null;
@@ -25,9 +32,34 @@ function markRejected() {
   tokenCache.rejectedAt = Date.now();
 }
 
-// Called when upstream returns 401/403: invalidate cache now, next request gets a new token
-// 上游返回 401/403 时调用：立刻作废缓存，下个请求换新 token
-export function invalidateGithubToken() {
+// Called when upstream returns 401/403: drop the memory cache AND write back to the
+// pool record immediately — without this, the record's 10-min quota freshness would
+// keep serving the same dead token for up to 10 minutes.
+//   status 401 → token revoked/bad: mark the record disabled in KV right away
+//   status 403 → quota likely exhausted: clear freshness so the next pick revalidates
+//   (a re-share via insertPoolRecord revives disabled records)
+// 上游返回 401/403 时调用：除清内存缓存外，立即回写池内那条记录——否则记录的 10 分钟
+// 保鲜额度会让同一枚失效 token 继续被选中长达 10 分钟。
+//   401 → token 被吊销/失效：立刻在 KV 中停用该记录
+//   403 → 额度大概率耗尽：清保鲜期，下次选取强制重新验活
+//   （insertPoolRecord 的重复分享可复活已停用记录）
+export function invalidateGithubToken(status) {
+  const kvb = poolKv();
+  if (kvb && tokenCache.poolKey) {
+    const key = tokenCache.poolKey;
+    (async () => {
+      try {
+        const raw = await kvb.get(key, 'json');
+        if (!raw) return;
+        if (status === 401) raw.disabled = true;
+        raw.checked_at = 0;
+        raw.updated_at = nowStr();
+        await kvb.put(key, JSON.stringify(raw));
+      } catch (e) {
+        // best-effort bookkeeping / 回写尽力而为
+      }
+    })();
+  }
   markRejected();
 }
 
@@ -47,6 +79,28 @@ export async function getGithubToken() {
   if (tokenCache.token && now - tokenCache.fetchedAt < TOKEN_CACHE_TTL_MS) {
     return tokenCache.token;
   }
+
+  // Primary: own KV pool (visitor-shared tokens; pickTokenRecord revalidates stale
+  // entries and counts a use). / 主源：自建 KV 池（页面访客共享的 token；
+  // pickTokenRecord 负责过期验活与使用计数）。
+  const kvb = poolKv();
+  if (kvb) {
+    try {
+      const picked = await pickTokenRecord(kvb);
+      if (picked && picked.rec && picked.rec.token) {
+        tokenCache.token = picked.rec.token;
+        tokenCache.fetchedAt = now;
+        tokenCache.poolKey = picked.key;
+        return tokenCache.token;
+      }
+    } catch (e) {
+      // KV unavailable: fall back / KV 异常：回退
+    }
+  }
+  tokenCache.poolKey = null;
+
+  // Fallback: tokenhub while our pool is empty or KV errors out
+  // 回退：自建池为空或 KV 异常时走 tokenhub
   try {
     const res = await fetch(TOKENHUB_API, {
       headers: { 'User-Agent': 'HomeAssistantMarketplace' },

@@ -87,3 +87,8 @@ td.no-top-border { border-top: none; }
 p.join { margin-top: 18px; }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; background: #e7f2e8; color: #1a7f37; }
 .pill.low { background: #fff1e5; color: #bc4c00; }
+
+/* ---- home pool usage line / 首页共享池用量行 ---- */
+.pool-usage { margin-top: 22px; padding-top: 14px; border-top: 1px solid #eaeef2; font-size: 12.5px; color: #57606a; line-height: 1.7; }
+.pool-usage .step-en { display: block; color: #8b949e; }
+.pool-usage b { font-weight: 600; color: #24292f; }

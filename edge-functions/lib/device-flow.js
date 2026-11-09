@@ -10,6 +10,12 @@
 // Required environment variables / 需要的环境变量:
 //   Client_ID      - OAuth App client id (public by design / 本身就是公开的)
 //   Client_Secret  - OAuth App client secret (configured in the EdgeOne console / 在 EdgeOne 控制台配置)
+//
+// On success the token is persisted into the self-hosted KV pool (namespace
+// `marketplace`, deduped by login) — see lib/kv-pool.js.
+// 成功后 token 落入自建 KV 池（命名空间 marketplace，按 login 去重）——见 lib/kv-pool.js。
+
+import { poolKv, insertPoolRecord, SESS_PREFIX } from './kv-pool.js';
 
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
@@ -59,12 +65,16 @@ function tooManyStarts(ip) {
   return false;
 }
 // Server-side session store for pending device flows.
-// KV is not provisioned yet — use in-isolate memory with TTL cleanup (single-isolate behavior is
-// acceptable for the preview phase; sessions are short-lived by design, ≤15min).
-// When EdgeOne KV lands, swap this object for the KV namespace binding (same get/put/delete shape).
-// Device Flow 会话暂存。KV 未开通前用 isolate 内存 + 过期清理（预览阶段可接受；会话天生短命 ≤15 分钟）。
-// EdgeOne KV 就绪后把此对象换成 KV 命名空间绑定（get/put/delete 同形替换）。
-const DEVFLOW_STORE = {
+// KV-backed (namespace `marketplace`) so sessions survive isolate recycles and
+// polls landing on a different edge isolate; falls back to an in-isolate Map when
+// the binding is absent. EdgeOne KV's put() carries no TTL option, so expiry lives
+// inside the record (expires_at) and is enforced on read — expired entries are
+// deleted lazily, plus an opportunistic sweep on start.
+// Device Flow 会话暂存：走 KV（命名空间 marketplace），会话可跨 isolate 存活、轮询
+// 落在其它边缘 isolate 也能取到；未绑定 KV 时退回 isolate 内存 Map。EdgeOne KV 的
+// put() 不带 TTL 参数，过期时间写在记录内（expires_at），读取时判定——过期条目懒
+// 删除，另在 start 时做机会式清扫。
+const DEVFLOW_MEM = {
   _m: new Map(),
   async put(k, v, opts) {
     this._m.set(k, { v, exp: Date.now() + ((opts && opts.expirationTtl) || 900) * 1000 });
@@ -79,6 +89,59 @@ const DEVFLOW_STORE = {
   async delete(k) { this._m.delete(k); },
   _sweep() { const now = Date.now(); for (const [k, e] of this._m) if (now > e.exp) this._m.delete(k); },
 };
+
+async function sessPut(key, value, ttlSeconds) {
+  const kvb = poolKv();
+  if (kvb) {
+    await kvb.put(SESS_PREFIX + key, value);
+    return;
+  }
+  await DEVFLOW_MEM.put(key, value, { expirationTtl: ttlSeconds });
+}
+
+async function sessGet(key) {
+  const kvb = poolKv();
+  if (!kvb) return DEVFLOW_MEM.get(key);
+  const raw = await kvb.get(SESS_PREFIX + key, 'text');
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw);
+    if (!p || (p.expires_at && Date.now() > p.expires_at)) {
+      await kvb.delete(SESS_PREFIX + key).catch(() => {});
+      return null;
+    }
+  } catch (e) {
+    await kvb.delete(SESS_PREFIX + key).catch(() => {});
+    return null;
+  }
+  return raw;
+}
+
+async function sessDelete(key) {
+  const kvb = poolKv();
+  if (kvb) return kvb.delete(SESS_PREFIX + key).catch(() => {});
+  return DEVFLOW_MEM.delete(key);
+}
+
+// Opportunistic sweep: ~5% of starts scan one page of KV sessions and drop expired
+// ones, so abandoned flows don't accumulate (KV has no TTL). / 机会式清扫：约 5% 的
+// start 会扫描一页 KV 会话并删除过期条目，避免被放弃的流程堆积（KV 无 TTL）。
+async function sweepSessions() {
+  const kvb = poolKv();
+  if (!kvb) return;
+  const page = await kvb.list({ prefix: SESS_PREFIX, limit: 256 });
+  if (!page || !Array.isArray(page.keys) || !page.keys.length) return;
+  const now = Date.now();
+  await Promise.all(page.keys.map(async (k) => {
+    try {
+      const raw = await kvb.get(k.name, 'text');
+      const p = raw ? JSON.parse(raw) : null;
+      if (!p || (p.expires_at && now > p.expires_at)) await kvb.delete(k.name);
+    } catch (e) {
+      await kvb.delete(k.name).catch(() => {});
+    }
+  }));
+}
 
 export async function startDeviceFlow(request, env) {
   const clientId = env && env.Client_ID;
@@ -120,14 +183,17 @@ export async function startDeviceFlow(request, env) {
     return err(502, 'upstream error');
   }
 
-  // Keep device_code server-side, addressable by an opaque session id
-  // device_code 留在服务端，用一个不透明会话 id 索引
-  const sessionId = crypto.randomUUID();
-  await DEVFLOW_STORE.put(sessionId, JSON.stringify({
+  // Keep device_code server-side, addressable by an opaque session id.
+  // 32-hex (no hyphens): EdgeOne KV keys only allow alphanumerics + underscore.
+  // device_code 留在服务端，用一个不透明会话 id 索引。
+  // 32 位十六进制（无连字符）：EdgeOne KV 的 key 仅允许字母数字与下划线。
+  const sessionId = crypto.randomUUID().replace(/-/g, '');
+  await sessPut(sessionId, JSON.stringify({
     device_code: data.device_code,
     created_at: Date.now(),
     expires_at: Date.now() + (Number(data.expires_in) || 900) * 1000,
-  }), { expirationTtl: Math.max(60, Math.min(900, Number(data.expires_in) || 900)) });
+  }), Math.max(60, Math.min(900, Number(data.expires_in) || 900)));
+  sweepSessions().catch(() => {});
 
   return json(200, {
     session: sessionId,
@@ -141,7 +207,10 @@ export async function startDeviceFlow(request, env) {
 // ---- POST /share/device/poll ----
 // Body: { session }
 // Returns while pending: { status: 'pending' | 'expired' | 'denied' }
-// On success: { status: 'ok', login, avatar_url } — the token stays on the server side.
+// On success: { status: 'ok', login, avatar_url, stored } — the token stays on the server side.
+// stored=false means the KV pool was unavailable (flow acknowledged, nothing persisted).
+// 成功返回 { status: 'ok', login, avatar_url, stored }——token 不出服务端。
+// stored=false 表示 KV 池不可用（流程确认成功但未落盘）。
 // In-memory dedupe so parallel tabs share one flow / 内存级去重，多标签页并发同一流程只入库一次
 // Bounded: entries older than 20 min are swept — the set never grows unboundedly.
 // 有界集合：超过 20 分钟的条目会被清扫，集合不会无限增长。
@@ -163,7 +232,7 @@ export async function pollDeviceFlow(request, env) {
   }
   const body = await readJsonBody(request);
   const session = typeof body.session === 'string' ? body.session : '';
-  if (!session || session.length > 64 || !/^[0-9a-f-]{36}$/i.test(session)) {
+  if (!session || session.length > 32 || !/^[0-9a-f]{32}$/i.test(session)) {
     return err(404, 'not found');
   }
   if (consumedSessions.has(session)) {
@@ -172,7 +241,7 @@ export async function pollDeviceFlow(request, env) {
 
   let rec;
   try {
-    rec = await DEVFLOW_STORE.get(session);
+    rec = await sessGet(session);
   } catch (e) {
     return err(502, 'upstream error');
   }
@@ -186,7 +255,7 @@ export async function pollDeviceFlow(request, env) {
     return err(502, 'upstream error');
   }
   if (!parsed.device_code || Date.now() > parsed.expires_at) {
-    await DEVFLOW_STORE.delete(session).catch(() => {});
+    await sessDelete(session).catch(() => {});
     return json(200, { status: 'expired' });
   }
 
@@ -221,11 +290,11 @@ export async function pollDeviceFlow(request, env) {
     return json(200, { status: 'pending', slow_down: true });
   }
   if (data.error === 'expired_token') {
-    await DEVFLOW_STORE.delete(session).catch(() => {});
+    await sessDelete(session).catch(() => {});
     return json(200, { status: 'expired' });
   }
   if (data.error === 'access_denied') {
-    await DEVFLOW_STORE.delete(session).catch(() => {});
+    await sessDelete(session).catch(() => {});
     return json(200, { status: 'denied' });
   }
   if (!data.access_token) {
@@ -253,16 +322,29 @@ export async function pollDeviceFlow(request, env) {
   if (!login) {
     // Token failed validation right after issuance — do not store it
     // 刚签发就验活失败——不入库
-    await DEVFLOW_STORE.delete(session).catch(() => {});
+    await sessDelete(session).catch(() => {});
     return err(502, 'upstream error');
   }
 
-  // KV is not provisioned yet: acknowledge the flow, drop the token (nothing persisted).
-  // When KV lands, replace this block with the pool insert (dedupe by login).
-  // KV 尚未开通：确认流程成功但丢弃 token（不落盘）。KV 就绪后把这里换成入池逻辑（按 login 去重）。
-  await DEVFLOW_STORE.delete(session).catch(() => {});
+  // Persist into the self-hosted KV pool, deduped by login (a re-share updates the
+  // record in place). When the KV binding is absent or the write fails, the flow
+  // still acknowledges success — the token is simply not stored (pre-provisioning
+  // behavior). The raw token never appears in the response.
+  // 落入自建 KV 池，按 login 去重（重复分享原地更新记录）。KV 绑定缺失或写入失败时
+  // 流程照常确认成功——只是不落盘（开通前行为）。token 明文绝不出现在响应里。
+  let stored = false;
+  const kvb = poolKv();
+  if (kvb) {
+    try {
+      const r = await insertPoolRecord(kvb, { token: data.access_token, login, avatar_url: avatarUrl });
+      stored = !!(r && r.ok);
+    } catch (e) {
+      stored = false;
+    }
+  }
+  await sessDelete(session).catch(() => {});
   sweepConsumed();
   consumedSessions.add(session);
 
-  return json(200, { status: 'ok', login, avatar_url: avatarUrl });
+  return json(200, { status: 'ok', login, avatar_url: avatarUrl, stored });
 }

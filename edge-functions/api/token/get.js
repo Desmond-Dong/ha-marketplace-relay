@@ -13,15 +13,14 @@
 //   }
 // }
 //
-// Data source / 数据源: self-hosted KV pool (primary, per-login dedupe & round-robin),
-// falling back to tokenhub while the KV pool is empty/unprovisioned.
-// 数据源：自建 KV 池（主，按 login 去重 + 轮换），KV 池为空/未开通时回退 tokenhub。
-//
-// Selection strategy / 选取策略: pick the record with the highest remaining quota among
-// freshly revalidated entries; records are revalidated against GitHub /rate_limit.
-// 在验活通过的记录里选剩余额度最高的一条；验活走 GitHub /rate_limit。
+// Data source / 数据源: self-hosted KV pool — namespace `marketplace` bound with the
+// variable name `marketplace` (per-login dedupe, best-remaining selection, dead tokens
+// pruned) — falling back to tokenhub while the pool is empty.
+// 数据源：自建 KV 池——命名空间 marketplace，绑定变量名 marketplace（按 login 去重、
+// 选剩余额度最高者、失效自动剔除）——池空时回退 tokenhub。
 
 import { TOKENHUB_API } from '../../lib/github-token.js';
+import { poolKv, pickTokenRecord, toTokenhubShape } from '../../lib/kv-pool.js';
 
 const jsonHeaders = {
   'content-type': 'application/json; charset=utf-8',
@@ -29,102 +28,17 @@ const jsonHeaders = {
   'cache-control': 'no-store',
 };
 
-// KV namespace binding is console-configured; absent before provisioning.
-// KV 命名空间绑定由控制台配置，开通前该全局变量不存在。
-function kv() {
-  return typeof TOKENPOOL_KV !== 'undefined' ? TOKENPOOL_KV : null;
-}
-
 function json(status, payload) {
   return new Response(JSON.stringify(payload), { status, headers: { ...jsonHeaders } });
 }
 
-function nowStr() {
-  return new Date().toISOString().replace('T', ' ').slice(0, 19);
-}
-
-// tokenhub-shaped record / tokenhub 形状的记录
-function shape(id, rec) {
-  return {
-    id,
-    created_at: rec.created_at,
-    updated_at: rec.updated_at,
-    type: 'github',
-    login: rec.login,
-    token: rec.token,
-    use_count: rec.use_count || 0,
-    remaining: rec.remaining != null ? rec.remaining : 0,
-    expired_at: rec.expired_at || '',
-    deleted_at: null,
-    usage: rec.usage || null,
-    usages: null,
-  };
-}
-
-// Revalidate one token against GitHub and return remaining quota, or null if dead.
-// 对单条 token 走 GitHub 验活，返回剩余额度；失效返回 null。
-async function revalidate(rec) {
-  try {
-    const res = await fetch('https://api.github.com/rate_limit', {
-      headers: {
-        authorization: `Bearer ${rec.token}`,
-        'user-agent': 'HomeAssistantMarketplace',
-        accept: 'application/vnd.github+json',
-      },
-    });
-    if (!res.ok) return null;
-    const d = await res.json();
-    const core = d && d.resources && d.resources.core;
-    if (!core || core.remaining <= 0) return null;
-    return core.remaining;
-  } catch (e) {
-    return null;
-  }
-}
-
-// Round-robin cursor in module scope (per-isolate); avoids always serving the same entry.
-// 模块级轮换游标（每 isolate），避免总是返回同一条。
-let rrCursor = 0;
-
 export async function onRequestGet() {
-  const kvb = kv();
+  const kvb = poolKv();
   if (kvb) {
     try {
-      // Load the whole pool (keys: pool/<n>, small pool by design / 键 pool/<n>, 池子天然小)
-      const keys = [];
-      let cursor;
-      do {
-        const page = await kvb.list({ prefix: 'pool/', limit: 256, cursor });
-        keys.push(...page.keys);
-        cursor = page.complete ? undefined : page.cursor;
-      } while (cursor);
-
-      let best = null;
-      for (const k of keys) {
-        const raw = await kvb.get(k.name, 'json');
-        if (!raw || !raw.token || raw.disabled) continue;
-        // Cache the quota for 10 min inside the record to bound /rate_limit calls.
-        // 记录内缓存额度 10 分钟，限制 /rate_limit 调用频次。
-        const fresh = raw.checked_at && Date.now() - raw.checked_at < 10 * 60 * 1000;
-        let remaining = fresh ? raw.remaining : await revalidate(raw);
-        if (remaining == null) {
-          // Dead token: mark disabled, prune from candidates.
-          // 失效 token：标记停用，剔出候选。
-          raw.disabled = true;
-          raw.updated_at = nowStr();
-          await kvb.put(k.name, JSON.stringify(raw));
-          continue;
-        }
-        raw.remaining = remaining;
-        raw.checked_at = Date.now();
-        if (!fresh) await kvb.put(k.name, JSON.stringify(raw));
-        if (!best || remaining > best.remaining) best = { key: k.name, rec: raw };
-      }
-      if (best) {
-        best.rec.use_count = (best.rec.use_count || 0) + 1;
-        best.rec.updated_at = nowStr();
-        await kvb.put(best.key, JSON.stringify(best.rec));
-        return json(200, { data: shape(Number(best.key.split('/')[1]), best.rec) });
+      const picked = await pickTokenRecord(kvb);
+      if (picked) {
+        return json(200, { data: toTokenhubShape(picked.id, picked.rec) });
       }
     } catch (e) {
       // KV errors fall through to tokenhub fallback / KV 异常落到 tokenhub 回退

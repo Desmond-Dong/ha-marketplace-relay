@@ -285,10 +285,13 @@ export async function onRequest(context) {
     }
   }
 
-  // Shared token rejected (quota exhausted / revoked): drop cache, next request fetches a fresh one
-  // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token
+  // Shared token rejected (quota exhausted / revoked): drop cache, next request fetches a fresh one.
+  // Passing the status lets the pool layer prune the exact record (401) or force
+  // revalidation (403) instead of serving the same dead token from its 10-min freshness.
+  // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token。传入状态码让池层精准
+  // 处理那条记录（401 停用 / 403 强制重新验活），避免 10 分钟保鲜期内反复拿到同一枚死 token
   if (isApi && (upstream.status === 401 || upstream.status === 403)) {
-    invalidateGithubToken();
+    invalidateGithubToken(upstream.status);
   }
 
   const resHeaders = new Headers();
