@@ -18,34 +18,70 @@ https://<your-domain>/https://raw.githubusercontent.com/owner/repo/main/file.txt
 Home Assistant Marketplace
         │  GET https://<域名>/https://api.github.com/…
         ▼
-[1] 门禁层（不涉及任何环境变量）
-    ├─ User-Agent 必须含 "HomeAssistantMarketplace"，否则 403
-    └─ 目标域名必须在 GitHub 白名单内，否则 403
+[1] 边缘函数入口
+    ├─ OPTIONS              → 204（CORS 预检）
+    ├─ /share/device/*      → 设备码流程处理器
+    ├─ /api/token/stats     → 脱敏池统计
+    └─ 其他非服务路径       → 静态页面；无匹配则 404
+        ▼  /https://… 形式的服务请求
+[2] 门禁层（不涉及任何凭据）
+    ├─ User-Agent 含 "HomeAssistantMarketplace" 或 "HomeAssistant"   → 否则 403
+    ├─ 每 IP 600 次 / 小时（滑动窗口）                              → 超出 429
+    ├─ 目标域名必须在 GitHub 官方白名单内                           → 否则 403
+    └─ 文件类型黑名单（镜像 / 安装包 / 视频 / 虚拟机磁盘）          → 命中 403
         ▼
-[2] URL 归一化与重映射
-    ├─ 修复折叠的协议头：https:/ → https://
+[3] URL 归一化与重映射
+    ├─ 修复被折叠的协议头：https:/ → https://
     └─ raw.githubusercontent.com/<o>/<r>/<ref>/<path>
-         被透明重映射到官方 Contents API：
+         透明改走官方 Contents API：
          api.github.com/repos/<o>/<r>/contents/<path>?ref=<ref>
          并附 Accept: application/vnd.github.raw（返回文件本体而非 JSON）
         ▼
-[3] 组装上游请求
+[4] 边缘缓存查询（仅 release 资产，且请求不带 Range）
+    ├─ 命中 → 直接返回缓存副本，x-cache: HIT（不触达上游）
+    └─ 未命中 → 继续走上游
+        ▼
+[5] 上游请求
     ├─ 显式设置 Host 头为目标域名（EdgeOne 运行时按 Host 路由，
     │   缺失会导致所有上游请求失败）
-    ├─ 剥离逐跳头与客户端的 authorization 头
-    └─ fetch() 使用 redirect: follow；body 流式转发
+    ├─ 剥离逐跳头与客户端自带的 authorization
+    ├─ api.github.com 请求附加共享池 token（下载类端点保持匿名）
+    └─ redirect: manual + 逐跳白名单校验（最多 5 跳）
         ▼
-[4] 上游：仅 GitHub 官方域名（白名单）
-    ├─ api.github.com        — API 调用；此处附加共享池 token
-    ├─ github.com            — 页面与 release 下载（302 → objects CDN，匿名）
-    ├─ codeload.github.com   — 源码包（匿名）
-    ├─ objects.githubusercontent.com — release 资产 CDN（匿名）
+[6] 上游：仅 GitHub 官方域名
+    ├─ api.github.com                — API；此处使用共享池 token
+    ├─ github.com                    — 页面与 release 下载（302 → 资产 CDN）
+    ├─ codeload.github.com           — 源码包
+    ├─ objects / release-assets      — release 资产 CDN
+    └─ gist.github.com 等            — gist 内容
         ▼
-[5] 响应回传客户端
+[7] 回传客户端
     ├─ 状态码原样透传（GitHub 的 404 就是 404）
-    ├─ 剥离逐跳头；支持 Range 断点（206）
-    └─ body 流式转发——函数 CPU 不随文件体积增长
+    ├─ 剥离逐跳头；附 CORS；支持 Range 断点（206）
+    ├─ 可缓存的 release 资产（体积在上限内）：
+    │   先写入边缘缓存，再回传，x-cache: MISS
+    └─ 其余响应：逐字节流式透传，函数 CPU 不随文件体积增长
 ```
+
+### 边缘缓存 / Edge cache
+
+release 资产是 Marketplace 更新时最大、最集中的流量。本服务对这类下载做边缘侧缓存，
+全自动、无需任何人工操作：
+
+- **只缓存 release 资产**（`/releases/download/` 路径）。API 调用、页面与源码包不进缓存。
+- **只缓存完整请求**。带 `Range` 头的断点续传请求直接转发上游，不读也不写缓存。
+- **只缓存体积在上限内的文件**。超出上限的大文件一律流式透传——先整体读入内存会超出
+  边缘函数的内存预算，反而拖垮下载。
+- **容量按文件数管理**。写入新文件时若已达上限，自动删除最老的缓存项，无需人工清理。
+- **响应头 `x-cache`** 标识本次结果：`HIT` 来自缓存，`MISS` 由上游取得并写入缓存。
+
+缓存是纯加速层：任何缓存异常都会退化为直接访问上游，不影响下载本身的正确性。
+
+### 上游可用性 / Upstream resilience
+
+- EdgeOne 节点到 `github.com`、`api.github.com` 的连通性偶发抖动。主链路遇到瞬时失败
+  会重试一次；设备码流程对 GitHub 的三次调用各自带退避重试。
+- 重定向不盲目跟随：每一跳都校验白名单，越界即拒绝，防止任何上游开放重定向被利用。
 
 ### 共享 token 用在哪里 / Token usage
 
@@ -58,11 +94,13 @@ Home Assistant Marketplace
   这是 EdgeOne 出口唯一可靠的 raw 路径。
 - **`/share/device/*` 端点**（token 共享页）代表页面访客与 GitHub OAuth Device Flow 通信；
   签发的 token 经 `/user` 验证后只留在服务端。
-- **`GET /api/token/get`** 返回一条池内记录，JSON 结构与 `tokenhub.hacs.vip/api/token/get`
-  完全一致（`{"data": {...}}`，含 `id` / `created_at` / `updated_at` / `type` / `login` /
-  `token` / `use_count` / `remaining` / `expired_at` / `deleted_at` / `usage`），现有消费方
-  只改 URL 即可切换。数据源以本项目自建 KV 池为主，池空或未开通时回退 tokenhub。
-  token 定期经 `rate_limit` 验活，返回剩余额度最高的一条。
+- **不提供任何对外发放 token 的端点**：token 明文绝不出边缘节点，服务在进程内直接取用
+  池内 token（`lib/github-token.js` → `pickTokenRecord`），不存在可泄露 token 的 HTTP 接口。
+- **`GET /api/token/stats`** 返回池的脱敏统计（login / 使用次数 / 最近验活的剩余额度 /
+  状态）与存储用量（记录数 / 估算字节），供贡献者页与首页展示；不含 token 明文，
+  `remaining` 只在保鲜期内有值、绝不过期展示。KV 的真实配额平台不向运行时暴露，
+  在控制台把环境变量 `KV_QUOTA_MB` 设为命名空间实际容量后，页面才会显示百分比，
+  未配置时只显示绝对用量。
 
 ### 透传与改写的边界 / Pass-through vs. rewriting
 
@@ -74,12 +112,13 @@ Home Assistant Marketplace
 | 请求体 | 流式透传，不做修改 |
 | 响应状态码 | 原样透传 |
 | 响应头 | 剥离逐跳头，附加 CORS，其余透传 |
-| 响应体 | 逐字节流式透传 |
+| 响应体 | 逐字节流式透传；可缓存的 release 资产先写入边缘缓存再回传 |
 
 ## 请求要求
 
-- 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace`
-- 仅允许 `github.com` 及其子域
+- 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace` 或 `HomeAssistant`
+- 仅允许 GitHub 官方域名（见上方流程中的白名单）
+- 每 IP 限流：600 次 / 小时
 
 ## 部署
 
@@ -91,13 +130,19 @@ Home Assistant Marketplace
 服务本身无需任何环境变量。启用 token 共享端点时，函数读取
 `Client_ID` / `Client_Secret`（Device Flow 用的 OAuth App）。
 
+KV 池使用 EdgeOne Pages KV：命名空间 `marketplace`，绑定变量名同为
+`marketplace`（函数以全局变量访问，不在 env 上）。可选环境变量
+`KV_QUOTA_MB`：设为 KV 命名空间的实际容量（MB），首页即按百分比显示存储
+用量；不设置则只显示绝对用量。
+
 ## 规划
 
-- [ ] 将共享 GitHub token 池从外部 tokenhub 迁移到本项目自建的 EdgeOne Pages KV 池（页面访客可自愿分享 token；页面仅展示脱敏统计——账号名 / 使用次数 / 剩余额度；token 明文不出边缘节点）。**KV 存储已提交申请，待腾讯云审核通过后开通，届时完成池接线。**
+- [x] 将共享 GitHub token 池从外部 tokenhub 迁移到本项目自建的 EdgeOne Pages KV 池（页面访客可自愿分享 token；贡献者页仅展示脱敏统计——账号名 / 使用次数 / 剩余额度；token 明文不出边缘节点）。**KV 已开通并完成接线（命名空间 `marketplace`）；tokenhub 保留为池空时的回退源。**
 - [x] GitHub OAuth Device Flow 一键分享 token：访客点击页面按钮，在 github.com/login/device 授权一个零 scope 的 OAuth App，token 自动入池（token 不经过浏览器；每位访客独立设备码；失效 token 定期验活自动剔除）
-- [x] `GET /api/token/get` —— 与 tokenhub 结构完全一致的池端点（自建 KV 池优先，tokenhub 回退）
-- [ ] Device Flow 成功后接入 KV 池入库（按 login 去重；KV 开通前流程成功但不落盘）
-- [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复
+- [x] Device Flow 成功后接入 KV 池入库（按 login 去重，重复分享原地更新 token；Device Flow 会话同样迁入 KV，跨 isolate 可靠）
+- [x] `GET /api/token/stats` —— 贡献者页的脱敏池统计（login / 使用次数 / 剩余额度 / 状态，无 token 明文）
+- [x] release 资产边缘缓存：只缓存完整请求、按文件数自动淘汰最老项，纯加速层不影响正确性
+- [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复（暂缓）
 
 ## README
 

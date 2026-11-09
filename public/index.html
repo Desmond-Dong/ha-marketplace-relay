@@ -16,10 +16,40 @@
     <a href="/contributors/">贡献者<span class="btn-en">Contributors</span></a>
     <a class="primary" href="/share/">共享 Token<span class="btn-en">Share Token</span></a>
   </nav>
+  <p class="pool-usage" id="poolUsage" hidden></p>
   <footer class="links">
     <a href="https://www.home-assistant.io/" target="_blank" rel="noopener">Home Assistant 官网<span class="btn-en">home-assistant.io</span></a>
     <a href="https://www.hasscn.top/" target="_blank" rel="noopener">HASSCN 社区<span class="btn-en">hasscn.top</span></a>
   </footer>
 </div>
+
+<script>
+// 共享池用量：拉取 /api/token/stats 的脱敏统计，展示记录数与 KV 存储占用。
+// KV 真实配额平台不向运行时暴露，配置了 KV_QUOTA_MB 环境变量才显示百分比。
+// Pool usage: pull /api/token/stats (masked) and show record count + KV storage usage.
+// The platform does not expose the real quota to the runtime — the percentage only
+// appears when the KV_QUOTA_MB env var is configured.
+(function () {
+  const el = document.getElementById('poolUsage');
+  const fmtBytes = (n) => n < 1024 ? n + ' B' : n < 1024 * 1024 ? (n / 1024).toFixed(1) + ' KB' : (n / (1024 * 1024)).toFixed(2) + ' MB';
+  fetch('/api/token/stats')
+    .then((r) => { if (!r.ok) throw new Error('bad status'); return r.json(); })
+    .then((d) => {
+      const s = d && d.storage;
+      if (!s || typeof s.bytes !== 'number' || !el) return;
+      let zh = '共享池存储 · <b>' + (s.records || 0) + '</b> 条 token · 已用约 <b>' + fmtBytes(s.bytes) + '</b>';
+      let en = 'Pool storage · <b>' + (s.records || 0) + '</b> tokens · ~<b>' + fmtBytes(s.bytes) + '</b> used';
+      if (s.quota_bytes) {
+        const pct = (s.bytes / s.quota_bytes) * 100;
+        const pctStr = (pct >= 1 ? pct.toFixed(1) : pct.toFixed(4)) + '%';
+        zh += '（配额 ' + pctStr + '）';
+        en += ' (' + pctStr + ' of quota)';
+      }
+      el.innerHTML = zh + '<span class="step-en">' + en + '</span>';
+      el.hidden = false;
+    })
+    .catch(() => { /* 统计不可用时保持隐藏 / keep hidden when stats are unavailable */ });
+})();
+</script>
 </body>
 </html>

@@ -17,6 +17,8 @@
 
 import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
+import { getPoolStats } from './lib/pool-api.js';
+import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -78,6 +80,10 @@ function blockedFileRequest(pathname) {
 // Marketplace 安装只有少量 API 调用加一次归档下载，600 远高于真实客户端，足以拦脚本刷量
 const RATE_LIMIT_WINDOW_MS = 3600 * 1000;
 const RATE_LIMIT_MAX = 600;
+// Upper bound for a body that goes through the Blob cache path / 走 Blob 缓存路径的 body 体积上限
+// Buffering above this blows the edge function memory budget (observed 504 on a 19 MB zip).
+// 超过该值的缓冲会超边缘函数内存预算（19MB zip 实测 504）。
+const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 const rateBuckets = new Map(); // ip -> [timestamps]
 function rateLimited(ip) {
   const now = Date.now();
@@ -151,11 +157,27 @@ export async function onRequest(context) {
     return pollDeviceFlow(request, env);
   }
 
+  // Shared-pool public API (moved out of api/ subdirectory files: the bundler cannot
+  // resolve '../../' imports there — handlers live in lib/pool-api.js; URLs unchanged)
+  // 共享池公开 API（从 api/ 子目录迁出：打包器无法解析那里的 '../../' 导入——处理器
+  // 在 lib/pool-api.js；URL 不变）
+  if (url.pathname === '/api/token/stats' && request.method === 'GET') {
+    return getPoolStats(env);
+  }
+
   // Non-proxy paths that look like pages should fall through to static assets
   // (the catch-all below only handles /https://... prefixed proxy requests)
   // 看起来是页面的非代理路径继续走静态资源（下方 catch-all 只处理 /https://… 前缀的代理请求）
   if (!/^https?:/i.test(url.pathname.slice(1))) {
-    return context.next();
+    // context.next() throws when no static asset matches (EdgeOne returns 545 / "Error return
+    // from script"); turn that into a clean 404 instead of a fake function error.
+    // context.next() 在无匹配静态资源时会抛错（EdgeOne 返回 545 / "Error return from script"），
+    // 这里兜底成正常 404，避免把不存在的路径伪装成函数故障。
+    try {
+      return await context.next();
+    } catch (e) {
+      return jsonError(404, 'not found');
+    }
   }
 
   // UA whitelist check / UA 白名单校验
@@ -210,6 +232,29 @@ export async function onRequest(context) {
   }
   // Never forward proxy-internal params upstream / 代理内部参数不透传给上游
   target.searchParams.delete('key');
+
+  // Blob cache: check if this request should be cached / Blob 缓存：检查是否应缓存此请求
+  const cacheEnabled = shouldCache(target.toString());
+  const rangeHeader = request.headers.get('range');
+  const hasRange = !!rangeHeader;
+  
+  let cachedResult = null;
+  if (cacheEnabled && !hasRange) {
+    // Only cache full requests (no Range header)
+    // 只缓存完整请求（无 Range 头）
+    cachedResult = await findCached(target.toString());
+    if (cachedResult) {
+      // Cache hit / 缓存命中
+      const resHeaders = new Headers();
+      resHeaders.set('content-type', cachedResult.contentType || 'application/octet-stream');
+      resHeaders.set('x-cache', 'HIT');
+      withCors(resHeaders);
+      return new Response(cachedResult.body, {
+        status: 200,
+        headers: resHeaders,
+      });
+    }
+  }
 
   // ---- Upstream request headers / 构造上游请求头 ----
   const headers = new Headers();
@@ -285,10 +330,13 @@ export async function onRequest(context) {
     }
   }
 
-  // Shared token rejected (quota exhausted / revoked): drop cache, next request fetches a fresh one
-  // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token
+  // Shared token rejected (quota exhausted / revoked): drop cache, next request fetches a fresh one.
+  // Passing the status lets the pool layer prune the exact record (401) or force
+  // revalidation (403) instead of serving the same dead token from its 10-min freshness.
+  // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token。传入状态码让池层精准
+  // 处理那条记录（401 停用 / 403 强制重新验活），避免 10 分钟保鲜期内反复拿到同一枚死 token
   if (isApi && (upstream.status === 401 || upstream.status === 403)) {
-    invalidateGithubToken();
+    invalidateGithubToken(upstream.status, context);
   }
 
   const resHeaders = new Headers();
@@ -307,6 +355,40 @@ export async function onRequest(context) {
 
   // Stream the body through: function CPU doesn't grow with size (CPU limit excludes I/O wait)
   // 流式透传 body：函数 CPU 不随体积增长（CPU 限制不含 I/O 等待）
+
+  // Blob write needs the whole body in memory first, so only small assets are cacheable;
+  // buffering a 19 MB release zip here blows the edge memory/CPU budget and the edge answers 504.
+  // Blob 写入必须先把整个 body 读进内存，因此只缓存小文件；把 19MB 的 release zip 缓冲下来
+  // 会超出边缘内存/CPU 预算，边缘直接返回 504（实测大文件全量下载 504、Range 流式 206 正常）。
+  const contentLength = Number(upstream.headers.get('content-length') || 0);
+  const cacheable = cacheEnabled && !hasRange && !cachedResult
+    && upstream.status >= 200 && upstream.status < 300
+    && contentLength > 0 && contentLength <= MAX_CACHE_BYTES;
+
+  // If cacheable and successful, write to Blob / 可缓存且成功时写入 Blob
+  if (cacheable) {
+    const contentType = resHeaders.get('content-type') || 'application/octet-stream';
+    let bodyBuffer;
+    try {
+      bodyBuffer = await upstream.arrayBuffer();
+    } catch (e) {
+      // Buffer read failed → cannot cache, and the body is already consumed; report upstream error
+      // 缓冲读取失败 → 无法缓存，body 也已被消费，按上游错误返回
+      return jsonError(502, 'upstream error');
+    }
+
+    // Write to cache before responding: a fire-and-forget write is dropped when the edge
+    // freezes the function right after the response is sent (observed: MISS on every request).
+    // 响应前完成写入：fire-and-forget 的写会在响应发出后函数被冻结时丢失（实测每次都是 MISS）
+    await setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
+
+    resHeaders.set('x-cache', 'MISS');
+    return new Response(bodyBuffer, {
+      status: upstream.status,
+      headers: resHeaders,
+    });
+  }
+
   return new Response(upstream.body, {
     status: upstream.status,
     headers: resHeaders,

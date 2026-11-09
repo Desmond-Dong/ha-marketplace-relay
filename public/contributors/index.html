@@ -24,13 +24,46 @@
         <th>状态<span class="en">Status</span></th>
       </tr>
     </thead>
-    <tbody>
-      <tr><td colspan="4" class="muted">共享池功能建设中，数据即将上线</td></tr>
-      <tr><td colspan="4" class="muted step-en no-top-border">Pool coming soon</td></tr>
+    <tbody id="poolBody">
+      <tr><td colspan="4" class="muted">加载中…</td></tr>
+      <tr><td colspan="4" class="muted step-en no-top-border">Loading…</td></tr>
     </tbody>
   </table>
   <p class="desc join">想加入？前往 <a href="/share/">共享 Token</a> 页面，一键授权即可。</p>
   <p class="desc en">Want to join? Visit <a href="/share/">Share Token</a> to contribute in one click.</p>
 </div>
+
+<script>
+// 贡献者列表：拉取 /api/token/stats（脱敏统计）渲染，失败时静默保留占位文案
+// Contributor list: fetch /api/token/stats (masked stats); on failure keep placeholders
+const poolBody = document.getElementById('poolBody');
+const PLACEHOLDER =
+  '<tr><td colspan="4" class="muted">共享池数据暂时不可用，稍后再来看看</td></tr>' +
+  '<tr><td colspan="4" class="muted step-en no-top-border">Pool data unavailable — check back later</td></tr>';
+// login 来自 GitHub 公开资料，插入 DOM 前转义 / logins come from public GitHub profiles; escape before injecting
+const esc = (s) => String(s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+function render(list) {
+  if (!list.length) {
+    poolBody.innerHTML =
+      '<tr><td colspan="4" class="muted">池内还没有共享 Token，成为第一位贡献者吧</td></tr>' +
+      '<tr><td colspan="4" class="muted step-en no-top-border">The pool is empty — be the first contributor</td></tr>';
+    return;
+  }
+  poolBody.innerHTML = list.map((c) => {
+    const pill = c.status === 'active'
+      ? '<span class="pill">可用</span><span class="step-en">Active</span>'
+      : '<span class="pill low">已失效</span><span class="step-en">Inactive</span>';
+    const rem = c.remaining == null ? '—' : String(c.remaining);
+    return '<tr><td><a href="https://github.com/' + esc(c.login) + '" target="_blank" rel="noopener noreferrer">' + esc(c.login) + '</a></td><td>' + Number(c.use_count || 0) +
+      '</td><td>' + esc(rem) + '</td><td>' + pill + '</td></tr>';
+  }).join('');
+}
+
+fetch('/api/token/stats')
+  .then((r) => { if (!r.ok) throw new Error('bad status'); return r.json(); })
+  .then((d) => render(Array.isArray(d && d.contributors) ? d.contributors : []))
+  .catch(() => { poolBody.innerHTML = PLACEHOLDER; });
+</script>
 </body>
 </html>
