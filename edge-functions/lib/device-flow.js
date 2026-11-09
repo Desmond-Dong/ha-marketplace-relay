@@ -20,12 +20,13 @@ import { poolKv, insertPoolRecord, listKeyNames, SESS_PREFIX } from './kv-pool.j
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 
-// start retry budget: total wall time and per-attempt cap. Edge nodes tolerate
-// 15s+ of waiting (observed), so ~22s total stays clear of platform limits.
-// start 重试预算：总时长与单次上限。实测边缘节点可等待 15 秒以上，
-// 总预算 22 秒不会触到平台限制。
+// start retry budget: per-attempt cap 3s (a healthy handshake answers in ~1s;
+// anything longer is a stalled connection worth abandoning) and ~22s total, which
+// stays clear of observed edge-node waiting tolerance.
+// start 重试预算：单次上限 3 秒（健康握手约 1 秒内应答，超过就是值得放弃的挂起连接）；
+// 总预算约 22 秒，不触碰实测的边缘节点等待上限。
 const DEV_START_BUDGET_MS = 22000;
-const DEV_START_ATTEMPT_MS = 7000;
+const DEV_START_ATTEMPT_MS = 3000;
 const GITHUB_USER_URL = 'https://api.github.com/user';
 
 const jsonHeaders = {
