@@ -449,6 +449,36 @@ async function handleRequest(context) {
     });
   }
 
+  // Streaming a large upstream HTML body can die mid-flight on the EdgeOne egress
+  // (observed: github.com/large page → opaque 545 "script error" or 504, while API and
+  // asset downloads over the same path are fine). HTML pages are small, so buffer them:
+  // a broken read becomes a catchable error instead of a stream that dies after the
+  // response headers were already sent. Everything else keeps streaming.
+  // 大体积上游 HTML 的 body 流在 EdgeOne 出口可能中途断掉（实测 github.com/ 大页面 →
+  // 不透明 545「script error」或 504，而同链路的 API 与资产下载正常）。HTML 体积小，
+  // 改为整体缓冲：读取失败变成可捕获的错误，不再是响应头已发出后流才断。其余仍流式。
+  const contentType = (resHeaders.get('content-type') || '').toLowerCase();
+  const isHtml = contentType.includes('text/html');
+  const declaredLen = Number(upstream.headers.get('content-length') || 0);
+  const bufferHtml = isHtml && request.method !== 'HEAD' && declaredLen <= 4 * 1024 * 1024;
+
+  if (bufferHtml) {
+    try {
+      const buf = await upstream.arrayBuffer();
+      return new Response(buf, { status: upstream.status, headers: resHeaders });
+    } catch (e) {
+      // Retry the whole fetch once: the failure is usually a flaky egress socket.
+      // 整体重试一次：这类失败通常是出口连接抖动。
+      try {
+        const retry = await fetchUpstream(target, headers, request.method, undefined);
+        const buf2 = await retry.arrayBuffer();
+        return new Response(buf2, { status: retry.status, headers: resHeaders });
+      } catch (e2) {
+        return jsonError(502, 'upstream error');
+      }
+    }
+  }
+
   return new Response(upstream.body, {
     status: upstream.status,
     headers: resHeaders,
