@@ -89,15 +89,28 @@ export async function listKeyNames(kvb, prefix) {
   let pages = 0;
   do {
     // Hard page cap: a 6-record pool must never paginate forever — if the platform
-    // misbehaves (e.g. complete=false with a null cursor), bail out with whatever
-    // was collected. / 硬性翻页上限：6 条记录的池绝不允许无限翻页——平台行为异常
-    // （如 complete=false 但 cursor 为空）时带着已收集的结果退出。
+    // misbehaves, bail out with whatever was collected. / 硬性翻页上限：6 条记录的池
+    // 绝不允许无限翻页——平台行为异常时带着已收集的结果退出。
     if (++pages > 10) break;
-    let page = await kvb.list(mode === 'noprefix' ? { limit: 256, cursor } : { prefix, limit: 256, cursor });
+    // Live-probed runtime contract (see poolDiag): list options must NOT carry a
+    // cursor key with an undefined value — the runtime strict-checks it and throws
+    // "cursor type invalid. expect: 'string' get: 'undefined'". First page omits the
+    // key entirely; only a non-empty string cursor from the previous page is sent.
+    // cursor is empty-string when complete. Key elements are objects ({key} per the
+    // teo docs) but bare strings are accepted too.
+    // 线上实锤的运行时契约（见 poolDiag）：list 选项绝不能带值为 undefined 的 cursor
+    // 键——运行时严格校验直接抛 "cursor type invalid. expect: 'string' get:
+    // 'undefined'"。首页完全不带该键；仅当上一页返回非空字符串 cursor 才续传。遍历
+    // 完成时 cursor 为空字符串。键元素是对象（teo 文档的 {key}），裸字符串也兼容。
+    const opts = mode === 'noprefix' ? { limit: 256 } : { prefix, limit: 256 };
+    if (cursor) opts.cursor = cursor;
+    let page = await kvb.list(opts);
     let rawKeys = page && Array.isArray(page.keys) ? page.keys : null;
     if (mode === 'auto' && !rawKeys) {
       mode = 'noprefix';
-      page = await kvb.list({ limit: 256, cursor });
+      const opts2 = { limit: 256 };
+      if (cursor) opts2.cursor = cursor;
+      page = await kvb.list(opts2);
       rawKeys = page && Array.isArray(page.keys) ? page.keys : [];
     }
     if (mode === 'auto') mode = 'prefix';
@@ -113,11 +126,9 @@ export async function listKeyNames(kvb, prefix) {
       else n = '?';
       if (mode === 'prefix' || String(n).startsWith(prefix) || n === '?') names.push(String(n));
     }
-    // cursor is the first key of the next page per the docs, null when complete;
-    // requiring a truthy cursor guards against a platform quirk looping forever.
-    // cursor 按文档是下一页第一个键、遍历完成时为 null；要求非空才续翻，防止平台
-    // 行为异常时死循环。
-    cursor = page && !page.complete && page.cursor ? page.cursor : undefined;
+    // cursor comes back as empty string when complete; only forward a non-empty
+    // string. / cursor 遍历完成时为空字符串；仅续传非空字符串。
+    cursor = page && !page.complete && typeof page.cursor === 'string' && page.cursor ? page.cursor : undefined;
   } while (cursor);
   return names;
 }
