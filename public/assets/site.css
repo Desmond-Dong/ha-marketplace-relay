@@ -92,3 +92,7 @@ p.join { margin-top: 18px; }
 .pool-usage { margin-top: 22px; padding-top: 14px; border-top: 1px solid #eaeef2; font-size: 12.5px; color: #57606a; line-height: 1.7; }
 .pool-usage .step-en { display: block; color: #8b949e; }
 .pool-usage b { font-weight: 600; color: #24292f; }
+
+/* ---- home CTA hint / 首页共享引导 ---- */
+.cta-hint { font-size: 13px; line-height: 1.8; color: #57606a; margin: 14px 0 0; max-width: 34em; margin-left: auto; margin-right: auto; }
+p.cta-hint-en { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 4px 0 0; max-width: 36em; margin-left: auto; margin-right: auto; }
