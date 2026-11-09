@@ -102,8 +102,16 @@ export async function listKeyNames(kvb, prefix) {
     }
     if (mode === 'auto') mode = 'prefix';
     for (const k of rawKeys || []) {
-      const n = (k && (k.key || k.name)) || null;
-      if (n && (mode === 'prefix' || n.startsWith(prefix))) names.push(n);
+      // Accept every observed key shape: bare string, {key}, {name}. A shape this
+      // code does not understand is recorded as '?' and kept visible in poolDiag
+      // instead of silently vanishing. / 接受所有已观测键形状：裸字符串、{key}、
+      // {name}。无法识别的形状记为 '?' 并在 poolDiag 里可见，绝不静默消失。
+      let n = null;
+      if (typeof k === 'string') n = k;
+      else if (k && typeof k.key === 'string') n = k.key;
+      else if (k && typeof k.name === 'string') n = k.name;
+      else n = '?';
+      if (mode === 'prefix' || String(n).startsWith(prefix) || n === '?') names.push(String(n));
     }
     // cursor is the first key of the next page per the docs, null when complete;
     // requiring a truthy cursor guards against a platform quirk looping forever.
@@ -125,7 +133,20 @@ export async function listKeyNames(kvb, prefix) {
 export async function loadPool(kvb) {
   const names = await listKeyNames(kvb, POOL_PREFIX);
   if (!names.length) return [];
-  const vals = await Promise.all(names.map((name) => kvb.get(name, 'json')));
+  const vals = await Promise.all(names.map(async (name) => {
+    if (name === '?') return undefined; // unknown shape: surfaced via poolDiag / 未知形状：交给 poolDiag 呈现
+    // get() type variants differ across runtime versions; try both. / get() 的类型参数形态因运行时版本而异，两种都试。
+    try {
+      return await kvb.get(name, 'json');
+    } catch (e1) {
+      try {
+        return await kvb.get(name, { type: 'json' });
+      } catch (e2) {
+        const t = await kvb.get(name);
+        try { return t == null ? null : JSON.parse(t); } catch (_) { return t; }
+      }
+    }
+  }));
   const entries = [];
   names.forEach((name, i) => {
     const rec = vals[i];
@@ -252,4 +273,41 @@ export function toTokenhubShape(id, rec) {
     usage: rec.usage || null,
     usages: null,
   };
+}
+
+// ---- diagnostics (admin-key guarded, temporary) / 诊断（admin key 保护，临时）----
+// Dumps shape-only facts about the KV binding: binding presence, per-style list()
+// results (key NAMES only, never values), loadPool() outcome with the exact error.
+// Needed because the runtime KV behavior differs from the docs and only live probes
+// settle it. Remove once /api/token/stats is healthy.
+// 只输出 KV 绑定的形状事实：绑定是否存在、各调用形态的 list() 结果（仅键名，绝不含
+// 值）、loadPool() 的结果与确切错误。运行时 KV 行为与文档不一致，只有线上探针能定
+// 分晓。/api/token/stats 恢复健康后删除本段。
+export async function poolDiag() {
+  const out = { binding: {}, list: {}, loadPool: null };
+  const kvb = poolKv();
+  out.binding.resolved = kvb ? (typeof marketplace !== 'undefined' ? 'marketplace' : 'TOKENPOOL_KV') : null;
+  if (!kvb) return out;
+  for (const [name, arg] of [['noargs', undefined], ['limit', { limit: 20 }], ['prefix', { prefix: POOL_PREFIX, limit: 20 }]]) {
+    try {
+      const res = arg === undefined ? await kvb.list() : await kvb.list(arg);
+      const raw = res && Array.isArray(res.keys) ? res.keys : null;
+      out.list[name] = {
+        has_keys: raw !== null,
+        key_types: raw ? [...new Set(raw.map((k) => Array.isArray(k) ? 'array' : typeof k))] : null,
+        names: raw ? raw.slice(0, 20).map((k) => typeof k === 'string' ? k : (k && (k.key || k.name)) || '?') : null,
+        complete: res && res.complete,
+        cursor: res && res.cursor != null ? String(res.cursor).slice(0, 24) : null,
+      };
+    } catch (e) {
+      out.list[name] = { error: String(e && e.message || e) };
+    }
+  }
+  try {
+    const entries = await loadPool(kvb);
+    out.loadPool = { ok: true, count: entries.length, keys: entries.map((e) => e.key), logins: entries.map((e) => e.rec && e.rec.login || '?') };
+  } catch (e) {
+    out.loadPool = { ok: false, error: String(e && e.message || e) };
+  }
+  return out;
 }
