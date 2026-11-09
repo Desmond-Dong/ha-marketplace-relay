@@ -60,6 +60,22 @@ export function poolIdOf(key) {
 // login 的确定性 64 位键后缀（两轮独立 FNV-1a，Math.imul 保证 int32 乘法）。同一
 // login 永远映射同一个键：按 login 去重由构造保证而非扫描比对，不同边缘节点上的
 // 并发分享绝不可能互相覆盖。
+// Key suffix derived from the token itself, used when the login could not be resolved
+// (GitHub /user hiccup right after authorization). Losing the authorization because of
+// one failed profile lookup would throw away a token the user already granted.
+// 由 token 本身派生的键后缀：授权后 /user 抖动、拿不到 login 时使用。因为一次档案查询
+// 失败就丢掉用户已经授权好的 token，是不可接受的。
+function tokenKey(token) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (let i = 0; i < token.length; i++) {
+    const c = token.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2166136261) >>> 0;
+  }
+  return 't' + h1.toString(36) + h2.toString(36);
+}
+
 function loginKey(login, attempt) {
   const s = attempt ? `${login}#${attempt}` : String(login);
   let h1 = 0x811c9dc5;
@@ -268,19 +284,23 @@ export async function pickTokenRecord(kvb, excludeTokens) {
 export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
   const now = nowStr();
   for (let attempt = 0; attempt < 3; attempt++) {
-    const key = POOL_PREFIX + loginKey(login, attempt);
+    // Without a resolved login, key by the token so the record still lands and can be
+    // attributed later; a login-keyed record is preferred once /user answers.
+    // 拿不到 login 时按 token 派生键，记录照样落盘、之后还能补上归属；一旦 /user 有响应，
+    // 就优先用按 login 派生的键。
+    const key = POOL_PREFIX + (login ? loginKey(login, attempt) : tokenKey(token));
     let prev = null;
     try {
       prev = await kvb.get(key, 'json');
     } catch (e) {
       prev = null; // unreadable existing value → treat as absent, overwrite / 旧值读不出 → 视为不存在，覆盖
     }
-    if (prev && typeof prev === 'object' && prev.login && prev.login !== login) {
+    if (login && prev && typeof prev === 'object' && prev.login && prev.login !== login) {
       continue; // hash collision with a different login → escape via attempt suffix / 与其他 login 撞键 → 换后缀逃逸
     }
     const rec = {
       token,
-      login: login || '',
+      login: login || (prev && prev.login) || '',
       avatar_url: avatar_url || (prev && prev.avatar_url) || '',
       created_at: (prev && prev.created_at) || now,
       updated_at: now,

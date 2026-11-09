@@ -116,22 +116,43 @@ async function sessPut(key, value, ttlSeconds) {
   await DEVFLOW_MEM.put(key, value, { expirationTtl: ttlSeconds });
 }
 
+// Read the pending flow. A miss must NOT be turned into "expired" right away: the
+// session may still be propagating (KV reads are eventually consistent) or the read
+// may have hiccupped, and answering "expired" makes the page silently stop polling
+// and drop the authorization the visitor is completing in another tab.
+// 读取待授权流程。读不到时绝不能立刻当成「已过期」：会话可能还在传播（KV 读为最终
+// 一致），或读取抖动了一下；直接回「过期」会让页面静默停止轮询，把访客正在另一个
+// 标签页里完成的授权丢掉。
 async function sessGet(key) {
   const kvb = poolKv();
   if (!kvb) return DEVFLOW_MEM.get(key);
-  const raw = await kvb.get(SESS_PREFIX + key, 'text');
-  if (!raw) return null;
-  try {
-    const p = JSON.parse(raw);
-    if (!p || (p.expires_at && Date.now() > p.expires_at)) {
-      await kvb.delete(SESS_PREFIX + key).catch(() => {});
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let raw = null;
+    try {
+      raw = await kvb.get(SESS_PREFIX + key, 'text');
+    } catch (e) {
+      // Read error: retry, do not delete — a failed read says nothing about the value.
+      // 读取报错：重试而不是删除——读失败并不能说明值不存在。
+      if (attempt < 2) { await new Promise((r) => setTimeout(r, 150 * (attempt + 1))); continue; }
       return null;
     }
-  } catch (e) {
-    await kvb.delete(SESS_PREFIX + key).catch(() => {});
-    return null;
+    if (raw) {
+      try {
+        const p = JSON.parse(raw);
+        if (!p || (p.expires_at && Date.now() > p.expires_at)) {
+          await kvb.delete(SESS_PREFIX + key).catch(() => {});
+          return null;
+        }
+      } catch (e) {
+        await kvb.delete(SESS_PREFIX + key).catch(() => {});
+        return null;
+      }
+      return raw;
+    }
+    // Empty read: give it a moment, then try again / 读到空值：稍等再试
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
   }
-  return raw;
+  return null;
 }
 
 async function sessDelete(key) {
@@ -264,7 +285,12 @@ export async function pollDeviceFlow(request, env) {
     return err(502, 'upstream error');
   }
   if (!rec) {
-    return json(200, { status: 'expired' });
+    // Not found after retries: report pending, never "expired" — a false expiry stops
+    // the page from polling and the authorization in flight is lost. The page enforces
+    // its own 15-minute limit, and a genuinely abandoned session is swept server-side.
+    // 重试后仍读不到：回 pending，绝不回「过期」——误报过期会让页面停止轮询，正在进行的
+    // 授权就丢了。页面自身有 15 分钟时限，真正被放弃的会话由服务端清扫。
+    return json(200, { status: 'pending' });
   }
   let parsed;
   try {
@@ -337,12 +363,12 @@ export async function pollDeviceFlow(request, env) {
       avatarUrl = u.avatar_url || null;
     }
   } catch (e) { /* fallthrough: login optional / login 拿不到不阻断 */ }
-  if (!login) {
-    // Token failed validation right after issuance — do not store it
-    // 刚签发就验活失败——不入库
-    await sessDelete(session).catch(() => {});
-    return err(502, 'upstream error');
-  }
+  // A failed profile lookup is NOT proof the token is bad: EdgeOne egress to
+  // api.github.com is intermittent, and the authorization the user just completed must
+  // not be thrown away. Store it keyed by the token itself and let the pool attribute
+  // the login later; only a definite 401 (handled inside the request) means真失效.
+  // 档案查询失败不等于 token 失效：EdgeOne 出口到 api.github.com 偶发抖动，用户刚完成
+  // 的授权不能因此丢掉。按 token 派生键入库，归属留给池后续补；只有明确的 401 才算真失效。
 
   // Persist into the self-hosted KV pool, deduped by login (a re-share updates the
   // record in place). When the KV binding is absent or the write fails, the flow
