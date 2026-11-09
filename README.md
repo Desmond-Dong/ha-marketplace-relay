@@ -101,6 +101,17 @@ fetch and never affects download correctness.
   endpoints.
 - **Download endpoints stay anonymous for public repos** (they don't consume the
   API quota): release downloads, source archives, and the objects CDN.
+- **A rejected token is swapped and the request retried.** When `api.github.com`
+  answers 401 (revoked) or 403 that is genuinely quota exhaustion, the service drops
+  that token, immediately picks the next one from the pool and replays the same request.
+  A token is never tried twice within one request; up to 4 swaps are attempted, after
+  which the request falls back to an anonymous call. A real permission 403 (restricted
+  repo, forbidden resource) is returned to the client unchanged instead of burning
+  through the pool.
+- **Exhausted quota is not death.** A token that used up its hourly quota is skipped
+  only until its reset; it returns to the candidate set automatically. Only a definite
+  401 disables a record. One unusable token therefore never turns a user request into a
+  failure.
 - **Note on remapped raw files:** although raw.githubusercontent.com itself serves
   anonymous downloads for public repos, this service remaps raw requests to the
   Contents API (api.github.com), so those requests DO consume the shared pool's
