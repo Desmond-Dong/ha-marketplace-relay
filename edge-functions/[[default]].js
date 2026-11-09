@@ -147,14 +147,11 @@ export async function onRequest(context) {
   // handleRequest; failures become a plain 502 instead.
   // 任何未捕获异常都会变成 EdgeOne 那个不透明的 545「Error return from script」，
   // 客户端和日志都看不到真实原因。全部逻辑放进 handleRequest，失败统一成 502。
-  const id = rid();
-  const t0 = Date.now();
   try {
     const res = await handleRequest(context);
-    console.log(`[${id}] ${request.method} ${url.pathname} -> ${res.status} (${Date.now() - t0}ms)`);
     return res;
   } catch (e) {
-    console.error(`[${id}] UNCAUGHT ${request.method} ${url.pathname}: ${e && e.message}\n${e && e.stack}`);
+    console.error('UNCAUGHT handler error:', e && e.message, '\n', e && e.stack);
     // TEMP DIAG: surface the real error when the caller sends x-diag: 1
     // 临时诊断：请求带 x-diag: 1 时返回真实错误
     if (context.request.headers.get('x-diag') === '1') {
@@ -177,8 +174,22 @@ function rid() {
 }
 
 async function handleRequest(context) {
+  const t0 = Date.now();
+  try {
+    const res = await handleRequestInner(context);
+    console.log(`[req] ${context.request.method} ${new URL(context.request.url).pathname} -> ${res.status} (${Date.now() - t0}ms)`);
+    return res;
+  } catch (e) {
+    console.error('[req] handler threw:', e && e.message, '\n', e && e.stack);
+    throw e;
+  }
+}
+
+async function handleRequestInner(context) {
   const { request, env, params } = context;
-  const url = new URL(request.url);
+  const id = rid();
+  const reqUrl = new URL(request.url);
+  const url = reqUrl;
 
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: withCors(new Headers()) });
@@ -221,14 +232,14 @@ async function handleRequest(context) {
   // UA whitelist check / UA 白名单校验
   const ua = request.headers.get('user-agent') || '';
   if (!ALLOWED_UA_SUBSTRINGS.some((s) => ua.includes(s))) {
-    reqLog(id, 'reject UA', url.pathname);
+    reqLog(id, 'reject UA', reqUrl.pathname);
     return jsonError(403, 'not allowed');
   }
 
   // Per-IP rate limit / 每 IP 限流（UA 门禁之后，只限通过门禁的代理请求）
   const clientIp = request.headers.get('x-forwarded-for') || request.headers.get('eo-connecting-ip') || 'unknown';
   if (rateLimited(clientIp)) {
-    reqLog(id, 'rate limited', clientIp);
+    reqLog(id, 'rate limited', clientIp); // 
     return jsonError(429, 'too many requests');
   }
 
