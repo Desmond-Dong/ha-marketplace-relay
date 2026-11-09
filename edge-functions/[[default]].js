@@ -18,7 +18,7 @@
 import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
 import { getPoolStats } from './lib/pool-api.js';
-import { getCached, setCached, shouldCache, cacheKey } from './lib/blob-cache.js';
+import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
