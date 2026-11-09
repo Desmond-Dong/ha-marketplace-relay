@@ -60,6 +60,22 @@ export function poolIdOf(key) {
 // login 的确定性 64 位键后缀（两轮独立 FNV-1a，Math.imul 保证 int32 乘法）。同一
 // login 永远映射同一个键：按 login 去重由构造保证而非扫描比对，不同边缘节点上的
 // 并发分享绝不可能互相覆盖。
+// Key suffix derived from the token itself, used when the login could not be resolved
+// (GitHub /user hiccup right after authorization). Losing the authorization because of
+// one failed profile lookup would throw away a token the user already granted.
+// 由 token 本身派生的键后缀：授权后 /user 抖动、拿不到 login 时使用。因为一次档案查询
+// 失败就丢掉用户已经授权好的 token，是不可接受的。
+function tokenKey(token) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (let i = 0; i < token.length; i++) {
+    const c = token.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2166136261) >>> 0;
+  }
+  return 't' + h1.toString(36) + h2.toString(36);
+}
+
 function loginKey(login, attempt) {
   const s = attempt ? `${login}#${attempt}` : String(login);
   let h1 = 0x811c9dc5;
@@ -268,19 +284,23 @@ export async function pickTokenRecord(kvb, excludeTokens) {
 export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
   const now = nowStr();
   for (let attempt = 0; attempt < 3; attempt++) {
-    const key = POOL_PREFIX + loginKey(login, attempt);
+    // Without a resolved login, key by the token so the record still lands and can be
+    // attributed later; a login-keyed record is preferred once /user answers.
+    // 拿不到 login 时按 token 派生键，记录照样落盘、之后还能补上归属；一旦 /user 有响应，
+    // 就优先用按 login 派生的键。
+    const key = POOL_PREFIX + (login ? loginKey(login, attempt) : tokenKey(token));
     let prev = null;
     try {
       prev = await kvb.get(key, 'json');
     } catch (e) {
       prev = null; // unreadable existing value → treat as absent, overwrite / 旧值读不出 → 视为不存在，覆盖
     }
-    if (prev && typeof prev === 'object' && prev.login && prev.login !== login) {
+    if (login && prev && typeof prev === 'object' && prev.login && prev.login !== login) {
       continue; // hash collision with a different login → escape via attempt suffix / 与其他 login 撞键 → 换后缀逃逸
     }
     const rec = {
       token,
-      login: login || '',
+      login: login || (prev && prev.login) || '',
       avatar_url: avatar_url || (prev && prev.avatar_url) || '',
       created_at: (prev && prev.created_at) || now,
       updated_at: now,
@@ -289,12 +309,37 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
       checked_at: 0, // force revalidation on next pick / 下次选取强制验活
       // prev.disabled deliberately NOT carried: a re-share revives / 刻意不带 disabled：重分享即复活
     };
-    try {
-      await kvb.put(key, JSON.stringify(rec));
-      return { ok: true, id: poolIdOf(key), reused: !!prev };
-    } catch (e) {
-      return { ok: false }; // KV write failed (quota/runtime) — surfaced to the caller / KV 写失败（配额/运行时）——上抛给调用方
+    // Persist with retries and read back. A write that throws, or that "succeeds"
+    // without the value being readable, means the visitor's authorization did NOT land;
+    // returning ok there would silently lose a token the user already granted.
+    // 带重试地写入并回读校验。写报错、或写「成功」但读不回值，都说明访客的授权没有真正
+    // 落盘；此时回 ok 就等于静默丢掉用户已经授权好的 token。
+    for (let write = 0; write < 4; write++) {
+      try {
+        await kvb.put(key, JSON.stringify(rec));
+      } catch (e) {
+        if (write < 3) { await sleep(120 * (write + 1)); continue; }
+        return { ok: false, reason: 'put failed' };
+      }
+      // Verify (eventual consistency may need a beat) / 回读校验（最终一致需要一点时间）
+      for (let check = 0; check < 3; check++) {
+        await sleep(check === 0 ? 0 : 150 * check);
+        let back = null;
+        try {
+          back = await kvb.get(key, 'json');
+        } catch (e) {
+          back = null;
+        }
+        if (back && typeof back === 'object' && back.token === rec.token) {
+          return { ok: true, id: poolIdOf(key), reused: !!prev, key };
+        }
+      }
     }
+    return { ok: false, reason: 'verify failed' };
   }
-  return { ok: false };
+  return { ok: false, reason: 'key collision' };
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
