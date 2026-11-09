@@ -8,14 +8,16 @@
 // 里的 '../../' 导入（构建日志：Could not resolve ../../lib/kv-pool.js），因此共享
 // 模块必须全部位于 lib/、入口文件一律 './' 一级导入。URL 保持不变。
 //
-// GET /api/token/get  — one pool record, tokenhub-compatible JSON shape
-// GET /api/token/stats — masked pool stats (contributors page + home page usage line)
+// GET /api/token/stats — masked pool stats (contributors page + home page usage line).
+// NOTE: there is deliberately NO public token-issuing endpoint here. Token material
+// never leaves the edge node for external callers — the proxy uses the pool in-process
+// (lib/github-token.js → pickTokenRecord), so no HTTP surface can leak tokens.
 //
-// Data source / 数据源: self-hosted KV pool (namespace `marketplace`), tokenhub
-// fallback while the pool is empty. / 自建 KV 池（命名空间 marketplace），池空回退 tokenhub。
+// 数据源：自建 KV 池（命名空间 marketplace）。刻意不提供任何对外发放 token 的端点——
+// token 明文绝不出边缘节点，代理在进程内直接取用（lib/github-token.js →
+// pickTokenRecord），因此不存在可泄露 token 的 HTTP 接口。
 
-import { TOKENHUB_API } from './github-token.js';
-import { poolKv, pickTokenRecord, toTokenhubShape, loadPool, QUOTA_TTL_MS } from './kv-pool.js';
+import { poolKv, loadPool, QUOTA_TTL_MS } from './kv-pool.js';
 
 const noStoreHeaders = {
   'content-type': 'application/json; charset=utf-8',
@@ -29,61 +31,6 @@ function json(status, payload) {
 
 function nowStr() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
-}
-
-// ---- GET /api/token/get ----
-// Response shape / 返回结构:
-// { "data": { "id", "created_at", "updated_at", "type": "github", "login", "token",
-//             "use_count", "remaining", "expired_at": "", "deleted_at": null,
-//             "usage": ..., "usages": null } }
-// Selection: highest remaining quota among freshly revalidated entries; dead tokens
-// are marked disabled and pruned. / 选取：验活通过的记录里剩余额度最高者；失效自动
-// 停用剔除。
-export async function getTokenRecord(env) {
-  void env; // no env needed today; kept for handler-signature uniformity / 当前无需环境变量，签名统一保留
-  const kvb = poolKv();
-  if (kvb) {
-    try {
-      const picked = await pickTokenRecord(kvb);
-      if (picked) {
-        return json(200, { data: toTokenhubShape(picked.id, picked.rec) });
-      }
-    } catch (e) {
-      // KV errors fall through to tokenhub fallback / KV 异常落到 tokenhub 回退
-    }
-  }
-
-  // Fallback: proxy a tokenhub record verbatim (already the same shape), but strip
-  // third-party usage metadata (contains tokenhub's user_ip — never forward other
-  // services' access logs). / 回退：转发 tokenhub 记录（结构一致），但剥除 usage 元数据
-  // （内含 tokenhub 侧 user_ip——绝不转发第三方服务的访问日志）。
-  try {
-    const res = await fetch(TOKENHUB_API, {
-      headers: { 'User-Agent': 'HomeAssistantMarketplace' },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.data && data.data.token) {
-        const d = data.data;
-        const clean = {
-          id: d.id,
-          created_at: d.created_at,
-          updated_at: d.updated_at,
-          type: d.type,
-          login: d.login,
-          token: d.token,
-          use_count: d.use_count,
-          remaining: d.remaining,
-          expired_at: d.expired_at || '',
-          deleted_at: null,
-          usage: null,
-          usages: null,
-        };
-        return json(200, { data: clean });
-      }
-    }
-  } catch (e) { /* tokenhub unreachable / tokenhub 不可达 */ }
-  return json(503, { error: 'pool unavailable' });
 }
 
 // ---- GET /api/token/stats ----

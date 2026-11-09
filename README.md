@@ -65,13 +65,9 @@ Home Assistant Marketplace
 - **`/share/device/*` endpoints** (token sharing page) talk to GitHub's OAuth Device
   Flow on behalf of the visitor; the issued token is validated via `/user` and stays
   on the server side.
-- **`GET /api/token/get`** returns one pool record in the same JSON shape as
-  `tokenhub.hacs.vip/api/token/get` (`{"data": {...}}` with `id` / `created_at` /
-  `updated_at` / `type` / `login` / `token` / `use_count` / `remaining` / `expired_at` /
-  `deleted_at` / `usage`), so existing consumers switch by changing the URL only.
-  Primary source is this project's own KV pool (namespace `marketplace`); it falls
-  back to tokenhub while the pool is empty. Tokens are revalidated against
-  `rate_limit` and the entry with the most remaining quota wins.
+- **No public token-issuing endpoint.** Token material never leaves the edge node for
+  external callers: the service consumes the pool in-process
+  (`lib/github-token.js` → `pickTokenRecord`), so no HTTP surface can hand out tokens.
 - **`GET /api/token/stats`** returns masked pool stats (login / use count / last-known
   remaining quota / status) plus storage usage (record count / approximate bytes) for
   the contributors page and the home page. No raw tokens; `remaining` is only present
@@ -115,7 +111,6 @@ storage usage as a percentage; without it only absolute usage is shown.
 
 - [x] Migrate the shared GitHub token pool from the external tokenhub to an EdgeOne Pages KV pool hosted in this project (visitors can voluntarily share tokens on the page; the contributors page shows only masked stats — login / use count / remaining quota; raw tokens never leave the edge). **KV is provisioned and wired up (namespace `marketplace`); tokenhub stays as the fallback while the pool is empty.**
 - [x] One-click token sharing via GitHub OAuth Device Flow: visitors click a button on the page, authorize a zero-scope OAuth App at github.com/login/device, and their token joins the pool automatically (no token ever touches the browser; per-visitor independent device codes; dead tokens auto-pruned via periodic revalidation)
-- [x] `GET /api/token/get` — tokenhub-compatible pool endpoint (same JSON shape; self-hosted KV pool primary, tokenhub fallback)
 - [x] Wire the Device Flow success path into the KV pool insert (deduped by login — a re-share updates the record in place; device-flow sessions live in KV too, reliable across isolates)
 - [x] `GET /api/token/stats` — masked pool stats for the contributors page (login / use count / remaining / status, no raw tokens)
 - [ ] Admin endpoints `export` / `import` (AdminKey auth) for KV backup & restore (deferred)

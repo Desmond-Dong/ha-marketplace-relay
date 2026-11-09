@@ -267,21 +267,3 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
   }
   return { ok: false };
 }
-
-// tokenhub-shaped public record / tokenhub 形状的对外记录
-export function toTokenhubShape(id, rec) {
-  return {
-    id,
-    created_at: rec.created_at,
-    updated_at: rec.updated_at,
-    type: 'github',
-    login: rec.login,
-    token: rec.token,
-    use_count: rec.use_count || 0,
-    remaining: rec.remaining != null ? rec.remaining : 0,
-    expired_at: rec.expired_at || '',
-    deleted_at: null,
-    usage: rec.usage || null,
-    usages: null,
-  };
-}

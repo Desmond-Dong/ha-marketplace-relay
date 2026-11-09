@@ -58,11 +58,8 @@ Home Assistant Marketplace
   这是 EdgeOne 出口唯一可靠的 raw 路径。
 - **`/share/device/*` 端点**（token 共享页）代表页面访客与 GitHub OAuth Device Flow 通信；
   签发的 token 经 `/user` 验证后只留在服务端。
-- **`GET /api/token/get`** 返回一条池内记录，JSON 结构与 `tokenhub.hacs.vip/api/token/get`
-  完全一致（`{"data": {...}}`，含 `id` / `created_at` / `updated_at` / `type` / `login` /
-  `token` / `use_count` / `remaining` / `expired_at` / `deleted_at` / `usage`），现有消费方
-  只改 URL 即可切换。数据源为本项目自建 KV 池（命名空间 `marketplace`），池空或 KV 异常
-  时回退 tokenhub。token 定期经 `rate_limit` 验活，返回剩余额度最高的一条。
+- **不提供任何对外发放 token 的端点**：token 明文绝不出边缘节点，服务在进程内直接取用
+  池内 token（`lib/github-token.js` → `pickTokenRecord`），不存在可泄露 token 的 HTTP 接口。
 - **`GET /api/token/stats`** 返回池的脱敏统计（login / 使用次数 / 最近验活的剩余额度 /
   状态）与存储用量（记录数 / 估算字节），供贡献者页与首页展示；不含 token 明文，
   `remaining` 只在保鲜期内有值、绝不过期展示。KV 的真实配额平台不向运行时暴露，
@@ -105,7 +102,6 @@ KV 池使用 EdgeOne Pages KV：命名空间 `marketplace`，绑定变量名同�
 
 - [x] 将共享 GitHub token 池从外部 tokenhub 迁移到本项目自建的 EdgeOne Pages KV 池（页面访客可自愿分享 token；贡献者页仅展示脱敏统计——账号名 / 使用次数 / 剩余额度；token 明文不出边缘节点）。**KV 已开通并完成接线（命名空间 `marketplace`）；tokenhub 保留为池空时的回退源。**
 - [x] GitHub OAuth Device Flow 一键分享 token：访客点击页面按钮，在 github.com/login/device 授权一个零 scope 的 OAuth App，token 自动入池（token 不经过浏览器；每位访客独立设备码；失效 token 定期验活自动剔除）
-- [x] `GET /api/token/get` —— 与 tokenhub 结构完全一致的池端点（自建 KV 池优先，tokenhub 回退）
 - [x] Device Flow 成功后接入 KV 池入库（按 login 去重，重复分享原地更新 token；Device Flow 会话同样迁入 KV，跨 isolate 可靠）
 - [x] `GET /api/token/stats` —— 贡献者页的脱敏池统计（login / 使用次数 / 剩余额度 / 状态，无 token 明文）
 - [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复（暂缓）
