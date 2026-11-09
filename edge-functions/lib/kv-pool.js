@@ -86,7 +86,13 @@ export async function listKeyNames(kvb, prefix) {
   const names = [];
   let cursor;
   let mode = 'auto';
+  let pages = 0;
   do {
+    // Hard page cap: a 6-record pool must never paginate forever — if the platform
+    // misbehaves (e.g. complete=false with a null cursor), bail out with whatever
+    // was collected. / 硬性翻页上限：6 条记录的池绝不允许无限翻页——平台行为异常
+    // （如 complete=false 但 cursor 为空）时带着已收集的结果退出。
+    if (++pages > 10) break;
     let page = await kvb.list(mode === 'noprefix' ? { limit: 256, cursor } : { prefix, limit: 256, cursor });
     let rawKeys = page && Array.isArray(page.keys) ? page.keys : null;
     if (mode === 'auto' && !rawKeys) {
