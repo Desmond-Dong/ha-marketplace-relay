@@ -115,18 +115,13 @@ async function poll() {
     failures = 0;
     if (d.status === 'pending') { pollEl.textContent = '等待授权中…'; pollEn.textContent = 'Waiting for authorization…'; return; }
     clearInterval(timer);
-    if (d.status === 'ok' && d.stored === false) {
-      // The authorization worked but the record did not land: say so instead of
-      // pretending success, otherwise the visitor thinks they contributed and the
-      // pool never receives the token.
-      // 授权成功但记录没落盘：如实告知，不能假装成功——否则访客以为已贡献，
-      // 池里却始终没有这枚 token。
-      localStorage.removeItem('df_session');
-      codeStep.style.display = 'none';
-      finalEl.className = 'status';
-      finalEl.innerHTML = '授权成功，但保存失败，请再点一次「一键共享」。'
-        + '<span class="step-en">Authorized, but saving failed — please click "Share in One Click" again.</span>';
-      btn.disabled = false;
+    if (d.status === 'pending' && d.storing) {
+      // Authorized; the server is retrying persistence. Keep polling — the session is
+      // preserved and the same token is re-inserted until it verifiably lands.
+      // 已授权，服务端正在重试入库：继续轮询，会话保留，同一枚 token 会反复重试直到
+      // 确认落盘。
+      pollEl.textContent = '授权成功，正在保存…';
+      pollEn.textContent = 'Authorized — saving…';
       return;
     }
     if (d.status === 'ok') {

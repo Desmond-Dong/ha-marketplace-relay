@@ -309,12 +309,37 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
       checked_at: 0, // force revalidation on next pick / 下次选取强制验活
       // prev.disabled deliberately NOT carried: a re-share revives / 刻意不带 disabled：重分享即复活
     };
-    try {
-      await kvb.put(key, JSON.stringify(rec));
-      return { ok: true, id: poolIdOf(key), reused: !!prev };
-    } catch (e) {
-      return { ok: false }; // KV write failed (quota/runtime) — surfaced to the caller / KV 写失败（配额/运行时）——上抛给调用方
+    // Persist with retries and read back. A write that throws, or that "succeeds"
+    // without the value being readable, means the visitor's authorization did NOT land;
+    // returning ok there would silently lose a token the user already granted.
+    // 带重试地写入并回读校验。写报错、或写「成功」但读不回值，都说明访客的授权没有真正
+    // 落盘；此时回 ok 就等于静默丢掉用户已经授权好的 token。
+    for (let write = 0; write < 4; write++) {
+      try {
+        await kvb.put(key, JSON.stringify(rec));
+      } catch (e) {
+        if (write < 3) { await sleep(120 * (write + 1)); continue; }
+        return { ok: false, reason: 'put failed' };
+      }
+      // Verify (eventual consistency may need a beat) / 回读校验（最终一致需要一点时间）
+      for (let check = 0; check < 3; check++) {
+        await sleep(check === 0 ? 0 : 150 * check);
+        let back = null;
+        try {
+          back = await kvb.get(key, 'json');
+        } catch (e) {
+          back = null;
+        }
+        if (back && typeof back === 'object' && back.token === rec.token) {
+          return { ok: true, id: poolIdOf(key), reused: !!prev, key };
+        }
+      }
     }
+    return { ok: false, reason: 'verify failed' };
   }
-  return { ok: false };
+  return { ok: false, reason: 'key collision' };
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
