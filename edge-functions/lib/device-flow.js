@@ -195,6 +195,7 @@ async function sweepSessions() {
 }
 
 export async function startDeviceFlow(request, env) {
+  const id = crypto.randomUUID().slice(0, 8);
   const clientId = env && env.Client_ID;
   const clientSecret = env && env.Client_Secret;
   if (!clientId || !clientSecret) {
@@ -224,13 +225,16 @@ export async function startDeviceFlow(request, env) {
       body: JSON.stringify({ client_id: clientId, scope: '' }), // zero scope / 零权限
     });
   } catch (e) {
+    console.warn(`[${id}] device start fetch failed: ${e && e.message}`);
     return err(502, 'upstream error');
   }
   if (!res.ok) {
+    console.warn(`[${id}] device start upstream ${res.status}`);
     return err(502, 'upstream error');
   }
   const data = await res.json();
   if (!data || !data.device_code || !data.user_code) {
+    console.warn(`[${id}] device start malformed response`);
     return err(502, 'upstream error');
   }
 
@@ -246,6 +250,7 @@ export async function startDeviceFlow(request, env) {
   }), Math.max(60, Math.min(900, Number(data.expires_in) || 900)));
   sweepSessions().catch(() => {});
 
+  console.log(`[${id}] device start ok`, `session=${sessionId.slice(0, 8)}…`);
   return json(200, {
     session: sessionId,
     user_code: data.user_code,
@@ -318,6 +323,7 @@ export async function pollDeviceFlow(request, env) {
   // code 有效期——那个期限只约束向 GitHub 取 token，token 已经在手。再问只会得到过期，
   // 授权就彻底丢了。
   if (parsed.access_token) {
+    console.log(`[poll] retry insert for session ${session.slice(0,8)}… attempt=${parsed.store_attempts || 1}`);
     return finishWithToken(session, parsed.access_token, parsed.login || null, parsed.avatar_url || null);
   }
 
@@ -385,7 +391,10 @@ export async function pollDeviceFlow(request, env) {
       login = u.login || null;
       avatarUrl = u.avatar_url || null;
     }
-  } catch (e) { /* fallthrough: login optional / login 拿不到不阻断 */ }
+  } catch (e) {
+    console.warn('[poll] /user lookup failed; storing without login attribution', e && e.message);
+    /* login optional / login 拿不到不阻断 */
+  }
   // A failed profile lookup is NOT proof the token is bad: EdgeOne egress to
   // api.github.com is intermittent, and the authorization the user just completed must
   // not be thrown away. Store it keyed by the token itself and let the pool attribute
@@ -422,6 +431,7 @@ async function finishWithToken(session, accessToken, login, avatarUrl) {
   }
 
   if (!inserted || !inserted.ok) {
+    console.warn(`[poll] insert failed (${(inserted && inserted.reason) || 'unknown'}), keeping session for retry`);
     // Keep the session and hand the token back for the retry: store it in the session
     // record so a later poll can insert without asking GitHub again.
     // 保留会话并把 token 暂存进会话记录，后续轮询可直接重试入库，无需再问 GitHub。
@@ -452,6 +462,7 @@ async function finishWithToken(session, accessToken, login, avatarUrl) {
     return json(200, { status: 'pending', storing: true });
   }
 
+  console.log(`[poll] stored ok`, `login=${login || 'unknown'} reused=${!!(inserted && inserted.reused)}`);
   await sessDelete(session).catch(() => {});
   sweepConsumed();
   consumedSessions.add(session);

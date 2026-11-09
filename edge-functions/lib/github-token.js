@@ -71,6 +71,7 @@ export function invalidateGithubToken(status, context) {
       context.waitUntil(writeback);
     }
   }
+  console.warn(`[token] rejected (${status}), cache dropped`);
   markRejected();
 }
 
@@ -133,7 +134,9 @@ export async function getGithubToken(excludeTokens) {
       }
     }
   } catch (e) {
+    console.warn('[token] tokenhub unreachable', e && e.message);
     // tokenhub unreachable / tokenhub 不可达
   }
+  console.warn('[token] no token available -> anonymous');
   return null;
 }

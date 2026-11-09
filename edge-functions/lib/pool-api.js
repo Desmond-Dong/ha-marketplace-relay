@@ -89,6 +89,7 @@ export async function getPoolStats(env) {
       storage: { records: entries.length, bytes, quota_bytes: quotaBytes },
     });
   } catch (e) {
+    console.error('[stats] kv error', e && e.message);
     return json(502, { error: 'kv error' });
   }
 }
