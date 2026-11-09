@@ -146,8 +146,8 @@ fetch and never affects download correctness.
 ## Requirements
 
 - `User-Agent` must contain `HomeAssistantMarketplace` or `HomeAssistant`
-- Only the GitHub hosts the Marketplace flow actually uses: `api.github.com`, `github.com`, `codeload.github.com`, `raw.githubusercontent.com` (remapped to the Contents API), and the `objects` / `release-assets` asset CDNs
-- `gist.github.com` / `gist.githubusercontent.com` / `www.github.com` are NOT allowed — HACS and the Marketplace never need them, and every extra host is one more surface reachable through the service
+- Only the GitHub hosts the Marketplace flow actually uses: `api.github.com`, `github.com`, `www.github.com`, `codeload.github.com`, `raw.githubusercontent.com` (remapped to the Contents API), and the `objects` / `release-assets` asset CDNs
+- `gist.github.com` / `gist.githubusercontent.com` are NOT allowed — HACS and the Marketplace never fetch gist content, and every extra host is one more surface reachable through the service
 - Per-IP rate limit: 600 requests/hour
 
 ## Deployment

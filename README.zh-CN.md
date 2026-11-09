@@ -124,8 +124,8 @@ release 资产是 Marketplace 更新时最大、最集中的流量。本服务�
 ## 请求要求
 
 - 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace` 或 `HomeAssistant`
-- 仅允许 Marketplace 流程实际使用的 GitHub 主机：`api.github.com`、`github.com`、`codeload.github.com`、`raw.githubusercontent.com`（改写为 Contents API）、`objects` / `release-assets` 资产 CDN
-- 不放行 `gist.github.com` / `gist.githubusercontent.com` / `www.github.com`——HACS 与 Marketplace 不需要它们，白名单每多一个主机就多一块可被借道访问的面
+- 仅允许 Marketplace 流程实际使用的 GitHub 主机：`api.github.com`、`github.com`、`www.github.com`、`codeload.github.com`、`raw.githubusercontent.com`（改写为 Contents API）、`objects` / `release-assets` 资产 CDN
+- 不放行 `gist.github.com` / `gist.githubusercontent.com`——HACS 与 Marketplace 不从 gist 取内容，白名单每多一个主机就多一块可被借道访问的面
 - 每 IP 限流：600 次 / 小时
 
 ## 部署
