@@ -52,8 +52,7 @@ Home Assistant Marketplace
     ├─ api.github.com                — API; shared-pool token used here
     ├─ github.com                    — pages and release downloads (302 → asset CDN)
     ├─ codeload.github.com           — source archives
-    ├─ objects / release-assets      — release asset CDN
-    └─ gist.github.com and peers     — gist content
+    └─ objects / release-assets      — release asset CDN
         ▼
 [7] Response back to the client
     ├─ Status code passed through unchanged (GitHub's 404 stays 404)
@@ -147,7 +146,8 @@ fetch and never affects download correctness.
 ## Requirements
 
 - `User-Agent` must contain `HomeAssistantMarketplace` or `HomeAssistant`
-- Only GitHub official hosts are allowed (see the allowlist in the pipeline above)
+- Only the GitHub hosts the Marketplace flow actually uses: `api.github.com`, `github.com`, `codeload.github.com`, `raw.githubusercontent.com` (remapped to the Contents API), and the `objects` / `release-assets` asset CDNs
+- `gist.github.com` / `gist.githubusercontent.com` / `www.github.com` are NOT allowed — HACS and the Marketplace never need them, and every extra host is one more surface reachable through the service
 - Per-IP rate limit: 600 requests/hour
 
 ## Deployment

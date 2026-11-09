@@ -7,7 +7,6 @@
 //   /https://github.com/<owner>/<repo>/releases/...   -> release assets, follows 302 / release 资产（跟随 302）
 //   /https://raw.githubusercontent.com/<...>          -> repo files / 仓库文件
 //   /https://codeload.github.com/<...>                -> source archives / 源码包
-//   /https://gist.githubusercontent.com/<...>         -> gist files / gist 文件
 //
 // Auth / 鉴权: UA must contain HomeAssistantMarketplace; non-GitHub hosts rejected
 // UA 须含 HomeAssistantMarketplace；非 GitHub 域名拒绝
@@ -26,15 +25,18 @@ import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
 // Contents API on api.github.com (reachable; raw media type returns file bytes).
 // 注：EdgeOne 出口连不上 Fastly 托管的 raw.githubusercontent.com，
 // raw 路径自动改走 api.github.com 上的官方 Contents API（可达；raw 媒体类型返回文件本体）
+// Only the hosts the Marketplace flow actually touches. gist.github.com /
+// gist.githubusercontent.com and www.github.com are deliberately NOT allowed: HACS and
+// the Marketplace never fetch gists, and every host kept here is one more surface to
+// reach through the service. / 只保留 Marketplace 流程真正会用到的主机。
+// gist.github.com / gist.githubusercontent.com 与 www.github.com 刻意不放行：HACS 与
+// Marketplace 从不取用 gist，白名单里每多一个主机就多一块可被借道访问的面。
 const ALLOWED_HOSTS = new Set([
-  'api.github.com',
-  'github.com',
-  'www.github.com',
-  'raw.githubusercontent.com',
-  'codeload.github.com',
-  'gist.github.com',
-  'gist.githubusercontent.com',
-  'objects.githubusercontent.com',
+  'api.github.com',                  // API: repo metadata, releases
+  'github.com',                      // release download URLs (302 → asset CDN)
+  'codeload.github.com',             // source archives
+  'raw.githubusercontent.com',       // repo files (remapped to the Contents API)
+  'objects.githubusercontent.com',   // release asset CDN
   'release-assets.githubusercontent.com',
 ]);
 

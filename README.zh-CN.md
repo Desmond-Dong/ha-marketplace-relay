@@ -52,8 +52,7 @@ Home Assistant Marketplace
     ├─ api.github.com                — API；此处使用共享池 token
     ├─ github.com                    — 页面与 release 下载（302 → 资产 CDN）
     ├─ codeload.github.com           — 源码包
-    ├─ objects / release-assets      — release 资产 CDN
-    └─ gist.github.com 等            — gist 内容
+    └─ objects / release-assets      — release 资产 CDN
         ▼
 [7] 回传客户端
     ├─ 状态码原样透传（GitHub 的 404 就是 404）
@@ -125,7 +124,8 @@ release 资产是 Marketplace 更新时最大、最集中的流量。本服务�
 ## 请求要求
 
 - 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace` 或 `HomeAssistant`
-- 仅允许 GitHub 官方域名（见上方流程中的白名单）
+- 仅允许 Marketplace 流程实际使用的 GitHub 主机：`api.github.com`、`github.com`、`codeload.github.com`、`raw.githubusercontent.com`（改写为 Contents API）、`objects` / `release-assets` 资产 CDN
+- 不放行 `gist.github.com` / `gist.githubusercontent.com` / `www.github.com`——HACS 与 Marketplace 不需要它们，白名单每多一个主机就多一块可被借道访问的面
 - 每 IP 限流：600 次 / 小时
 
 ## 部署
