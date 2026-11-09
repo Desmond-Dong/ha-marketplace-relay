@@ -168,10 +168,15 @@ export async function loadPool(kvb) {
   return entries;
 }
 
-// Revalidate one token against GitHub /rate_limit; returns remaining quota,
-// or null when dead (401/403, exhausted, or unreachable).
-// 对单条 token 走 GitHub /rate_limit 验活；返回剩余额度，失效（401/403、耗尽、
-// 不可达）返回 null。
+// Revalidate one token against GitHub /rate_limit.
+// Returns a structured state, because these cases need different handling:
+//   { state: 'ok', remaining, resetAt }      usable
+//   { state: 'exhausted', remaining: 0 }     quota used up — NOT dead, recovers at reset
+//   { state: 'dead' }                       401/403: revoked or invalid, prune it
+//   { state: 'unreachable' }                 network hiccup — keep the record untouched
+// 对单条 token 走 GitHub /rate_limit 验活。返回结构化状态，因为几种情况处理方式不同：
+//   ok 可用 / exhausted 额度用尽（不是失效，重置后自动恢复）/ dead 401-403 已吊销 /
+//   unreachable 网络抖动（记录保持原状）。
 export async function revalidateQuota(rec) {
   try {
     const res = await fetch('https://api.github.com/rate_limit', {
@@ -181,13 +186,16 @@ export async function revalidateQuota(rec) {
         accept: 'application/vnd.github+json',
       },
     });
-    if (!res.ok) return null;
+    if (res.status === 401 || res.status === 403) return { state: 'dead' };
+    if (!res.ok) return { state: 'unreachable' };
     const d = await res.json();
     const core = d && d.resources && d.resources.core;
-    if (!core || core.remaining <= 0) return null;
-    return core.remaining;
+    if (!core || typeof core.remaining !== 'number') return { state: 'unreachable' };
+    const resetAt = core.reset ? core.reset * 1000 : 0;
+    if (core.remaining <= 0) return { state: 'exhausted', remaining: 0, resetAt };
+    return { state: 'ok', remaining: core.remaining, resetAt };
   } catch (e) {
-    return null;
+    return { state: 'unreachable' };
   }
 }
 
@@ -197,25 +205,48 @@ export async function revalidateQuota(rec) {
 // persisted. Returns { key, id, rec } or null when the pool is empty.
 // 在可用记录里选剩余额度最高的一条。过期条目重新验活；失效条目标记停用（剔出
 // 候选，重新分享可复活）。中选记录 use_count +1 并回写。池空返回 null。
-export async function pickTokenRecord(kvb) {
+export async function pickTokenRecord(kvb, excludeTokens) {
   const entries = await loadPool(kvb);
   let best = null;
+  let bestRemaining = -1;
   for (const e of entries) {
     const raw = e.rec;
     if (!raw || !raw.token || raw.disabled) continue;
-    const fresh = raw.checked_at && Date.now() - raw.checked_at < QUOTA_TTL_MS;
-    let remaining = fresh ? raw.remaining : await revalidateQuota(raw);
-    if (remaining == null) {
-      // Dead token: mark disabled, prune from candidates. / 失效 token：标记停用，剔出候选。
-      raw.disabled = true;
+    // Skip tokens already rejected during this request / 跳过本次请求中已被拒的 token
+    if (excludeTokens && excludeTokens.has(raw.token)) continue;
+
+    const now = Date.now();
+    // Exhausted quota recovers on its own at reset — never disable, just skip until then.
+    // 额度耗尽会在重置后自行恢复——绝不停用，仅在重置前跳过。
+    if (raw.reset_at && raw.reset_at > now && (raw.remaining || 0) <= 0) continue;
+
+    const fresh = raw.checked_at && now - raw.checked_at < QUOTA_TTL_MS;
+    let remaining;
+    if (fresh && typeof raw.remaining === 'number' && raw.remaining > 0) {
+      remaining = raw.remaining;
+    } else {
+      const v = await revalidateQuota(raw);
+      if (v.state === 'dead') {
+        // Revoked/invalid: mark disabled, prune from candidates. / 已吊销：标记停用，剔出候选。
+        raw.disabled = true;
+        raw.updated_at = nowStr();
+        await kvb.put(e.key, JSON.stringify(raw));
+        continue;
+      }
+      if (v.state === 'unreachable') {
+        // Cannot verify right now: skip this round, keep the record as-is.
+        // 暂时无法验证：本轮跳过，记录保持原状。
+        continue;
+      }
+      raw.remaining = v.remaining;
+      raw.checked_at = Date.now();
+      raw.reset_at = v.resetAt || 0;
       raw.updated_at = nowStr();
       await kvb.put(e.key, JSON.stringify(raw));
-      continue;
+      if (v.state === 'exhausted') continue;
+      remaining = v.remaining;
     }
-    raw.remaining = remaining;
-    raw.checked_at = Date.now();
-    if (!fresh) await kvb.put(e.key, JSON.stringify(raw));
-    if (!best || remaining > best.rec.remaining) best = e;
+    if (remaining > bestRemaining) { best = e; bestRemaining = remaining; }
   }
   if (!best) return null;
   best.rec.use_count = (best.rec.use_count || 0) + 1;

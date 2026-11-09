@@ -274,12 +274,6 @@ export async function onRequest(context) {
     // raw remap → Contents API: request the raw media type to get file bytes, not JSON metadata
     // raw 重映射 → Contents API：用 raw 媒体类型拿文件本体而非 JSON 元数据
     headers.set('Accept', rawRemap ? 'application/vnd.github.raw' : (request.headers.get('accept') || 'application/vnd.github+json'));
-    // API uses the shared token pool (download endpoints don't consume API quota)
-    // API 走共享池 token（下载类端点不占 API 配额）
-    const token = await getGithubToken();
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
-    }
   }
 
   // ---- Upstream fetch with allowlisted redirect following / 带白名单校验的重定向跟随 ----
@@ -318,25 +312,70 @@ export async function onRequest(context) {
     return jsonError(502, 'upstream error');
   }
 
-  let upstream;
-  try {
-    upstream = await fetchUpstream(target, headers, request.method, request.body);
-  } catch (e) {
-    // Single retry for transient upstream failures / 单次重试应对上游偶发失败
+  // ---- Fetch upstream, rotating the shared token when it is rejected ----
+  // A dead or exhausted pool token must never surface as a failed user request, so an
+  // api.github.com call that comes back 401/403 drops that token, picks another one and
+  // retries. Rejected tokens are excluded for this request, so a token can only be tried
+  // once. Only body-less methods are retried: the request body is a stream that the first
+  // attempt already consumed.
+  // 池内 token 失效或耗尽绝不能变成用户请求失败：api.github.com 返回 401/403 时丢弃该
+  // token、换下一枚并重试。本次请求内已排除被拒 token，同一枚不会被试两次。只有无请求体
+  // 的方法才重试——request body 是流，首次尝试已消费。
+  const MAX_TOKEN_ATTEMPTS = 4;
+  const rejectedTokens = new Set();
+  const canRetry = ['GET', 'HEAD'].includes(request.method);
+  let upstream = null;
+
+  for (let attempt = 0; attempt < MAX_TOKEN_ATTEMPTS; attempt++) {
+    if (isApi) {
+      const token = await getGithubToken(rejectedTokens);
+      if (token) headers.set('Authorization', `Bearer ${token}`);
+      else headers.delete('Authorization');
+    }
     try {
       upstream = await fetchUpstream(target, headers, request.method, request.body);
-    } catch (e2) {
-      return jsonError(502, 'upstream error');
+    } catch (e) {
+      if (attempt === 0) continue; // single retry for transient failures / 偶发失败重试一次
+      upstream = null;
+      break;
     }
-  }
+    if (!isApi || !canRetry) break;
+    const auth = headers.get('authorization') || '';
+    const usedToken = auth.replace(/^Bearer\s+/i, '');
+    if (!usedToken) break; // anonymous call: rotating tokens cannot help / 匿名调用，换 token 无意义
 
-  // Shared token rejected (quota exhausted / revoked): drop cache, next request fetches a fresh one.
-  // Passing the status lets the pool layer prune the exact record (401) or force
-  // revalidation (403) instead of serving the same dead token from its 10-min freshness.
-  // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token。传入状态码让池层精准
-  // 处理那条记录（401 停用 / 403 强制重新验活），避免 10 分钟保鲜期内反复拿到同一枚死 token
-  if (isApi && (upstream.status === 401 || upstream.status === 403)) {
+    if (upstream.status === 401) {
+      // Revoked/invalid token. / token 已吊销或无效。
+    } else if (upstream.status === 403) {
+      // 403 is also GitHub's rate-limit answer, but a genuine permission 403 (blocked
+      // repo, forbidden resource) must reach the client unchanged instead of burning
+      // through the whole pool. / 403 也可能是额度用尽，但真正的权限拒绝（仓库被限、
+      // 资源禁止）必须原样返回客户端，不能把整个池都试一遍。
+      const rlRemaining = upstream.headers.get('x-ratelimit-remaining');
+      if (rlRemaining === null || Number(rlRemaining) > 0) break;
+    } else {
+      break;
+    }
+
+    // This token is unusable: remember it, tell the pool, try the next one.
+    // Drain the rejected body so the connection can be reused. / 丢弃被拒响应的 body 以复用连接。
+    if (upstream.body) { try { await upstream.body.cancel(); } catch (e) {} }
+    rejectedTokens.add(usedToken);
     invalidateGithubToken(upstream.status, context);
+  }
+  if (!upstream) return jsonError(502, 'upstream error');
+
+  // Every pool token was rejected: fall back to an anonymous call (60/h) instead of
+  // handing the client a 401 the pool itself caused.
+  // 池内 token 全部被拒：退回匿名调用（60 次/时），不把池自身的问题变成客户端的 401。
+  if (isApi && canRetry && rejectedTokens.size > 0 && upstream
+      && (upstream.status === 401 || upstream.status === 403)) {
+    if (upstream.body) { try { await upstream.body.cancel(); } catch (e) {} }
+    headers.delete('Authorization');
+    try {
+      const anon = await fetchUpstream(target, headers, request.method, request.body);
+      if (anon) upstream = anon;
+    } catch (e) { /* keep the last response / 保留上一个响应 */ }
   }
 
   const resHeaders = new Headers();

@@ -17,7 +17,7 @@
 // token 明文绝不出边缘节点，代理在进程内直接取用（lib/github-token.js →
 // pickTokenRecord），因此不存在可泄露 token 的 HTTP 接口。
 
-import { poolKv, loadPool, QUOTA_TTL_MS } from './kv-pool.js';
+import { poolKv, loadPool } from './kv-pool.js';
 
 const noStoreHeaders = {
   'content-type': 'application/json; charset=utf-8',
@@ -35,8 +35,8 @@ function nowStr() {
 
 // ---- GET /api/token/stats ----
 // Masked fields only: login (public by design), use count, last-known remaining
-// quota (null outside the freshness window — never shown stale), status. No token
-// material, no IPs. Storage usage is measured from the records themselves (record
+// quota (the value from the most recent real use — never probed just to render this
+// table), status. No token material, no IPs. Storage usage is measured from the records themselves (record
 // count + approximate bytes). The real platform quota is NOT exposed to the runtime;
 // the optional KV_QUOTA_MB env var supplies the denominator for the percentage.
 // 只含脱敏字段：login（本就是公开信息）、使用次数、保鲜期内最近验活的剩余额度
@@ -50,14 +50,25 @@ export async function getPoolStats(env) {
   }
   try {
     const entries = await loadPool(kvb);
-    const now = Date.now();
+
+    // Last-known values only: no proactive revalidation here. The proxy refreshes a
+    // record's remaining quota whenever it actually picks that token (and on upstream
+    // 401/403), so an idle service makes no API calls just to fill this table.
+    // 只读最后已知值：这里不主动验活。代理每次真正取用某 token（以及上游 401/403）
+    // 时才会刷新剩余额度，服务空闲时不会为了填这张表而发起 API 调用。
     const contributors = entries
       .map((e) => {
-        const fresh = e.rec.checked_at && now - e.rec.checked_at < QUOTA_TTL_MS;
+        // A record inserted but never used yet carries remaining:0 / checked_at:0 as a
+        // "force revalidation" marker — that is not a known value, so keep it blank.
+        // 刚入库、尚未被取用的记录带着 remaining:0 / checked_at:0 的「强制验活」标记，
+        // 那不是已知值，保持空白。
+        const known = typeof e.rec.remaining === 'number' && e.rec.checked_at > 0;
         return {
           login: e.rec.login || 'anonymous',
           use_count: e.rec.use_count || 0,
-          remaining: !e.rec.disabled && fresh ? (e.rec.remaining || 0) : null,
+          // Last-known value, however old — never hidden and never probed on read.
+          // 最后一次已知值，不因过期而隐藏，也不为读它发起探测。
+          remaining: !e.rec.disabled && known ? e.rec.remaining : null,
           status: e.rec.disabled ? 'disabled' : 'active',
         };
       })

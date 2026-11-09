@@ -51,6 +51,11 @@ export function invalidateGithubToken(status, context) {
       try {
         const raw = await kvb.get(key, 'json');
         if (!raw) return;
+        // 401 means revoked/invalid → prune. 403 is almost always quota exhaustion, which
+        // recovers by itself: only clear freshness so the next pick re-checks it.
+        // Never disable a token merely for hitting its hourly quota.
+        // 401 才是吊销/无效 → 停用。403 基本是额度耗尽，会自行恢复：只清保鲜期让下次
+        // 选取重新验活。仅因一小时额度用完绝不停用 token。
         if (status === 401) raw.disabled = true;
         raw.checked_at = 0;
         raw.updated_at = nowStr();
@@ -77,13 +82,20 @@ function inCooldown() {
 
 // Returns a token or null (null = anonymous requests, 60/hour)
 // 返回 token 或 null（null = 匿名请求，60 次/时）
-export async function getGithubToken() {
-  if (inCooldown()) {
-    return null;
-  }
+export async function getGithubToken(excludeTokens) {
   const now = Date.now();
-  if (tokenCache.token && now - tokenCache.fetchedAt < TOKEN_CACHE_TTL_MS) {
+  const skipping = excludeTokens && excludeTokens.size > 0;
+  // A cached token that was just rejected must not be handed out again in the same
+  // request; otherwise the cache serves it and the retry is pointless.
+  // 本次请求刚被拒的 token 不能再从缓存返回，否则重试毫无意义。
+  if (!skipping && tokenCache.token && now - tokenCache.fetchedAt < TOKEN_CACHE_TTL_MS) {
     return tokenCache.token;
+  }
+  if (!skipping && inCooldown()) {
+    // Cooldown only guards the fallback when nothing works right now; a retry that
+    // explicitly excludes rejected tokens still deserves a fresh pick.
+    // 冷却期只在「暂时无路可走」时生效；明确排除已拒 token 的重试仍应取新 token。
+    return null;
   }
 
   // Primary: own KV pool (visitor-shared tokens; pickTokenRecord revalidates stale
@@ -92,7 +104,7 @@ export async function getGithubToken() {
   const kvb = poolKv();
   if (kvb) {
     try {
-      const picked = await pickTokenRecord(kvb);
+      const picked = await pickTokenRecord(kvb, excludeTokens);
       if (picked && picked.rec && picked.rec.token) {
         tokenCache.token = picked.rec.token;
         tokenCache.fetchedAt = now;
@@ -114,7 +126,7 @@ export async function getGithubToken() {
     if (res.ok) {
       const data = await res.json();
       const token = data && data.data && data.data.token;
-      if (token) {
+      if (token && !(excludeTokens && excludeTokens.has(token))) {
         tokenCache.token = token;
         tokenCache.fetchedAt = now;
         return token;
