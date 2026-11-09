@@ -133,12 +133,14 @@ async function sweepSessions() {
   if (!page || !Array.isArray(page.keys) || !page.keys.length) return;
   const now = Date.now();
   await Promise.all(page.keys.map(async (k) => {
+    const name = (k && (k.key || k.name)) || null; // ListKey.key per Tencent docs / 腾讯官方文档 ListKey.key
+    if (!name) return;
     try {
-      const raw = await kvb.get(k.name, 'text');
+      const raw = await kvb.get(name, 'text');
       const p = raw ? JSON.parse(raw) : null;
-      if (!p || (p.expires_at && now > p.expires_at)) await kvb.delete(k.name);
+      if (!p || (p.expires_at && now > p.expires_at)) await kvb.delete(name);
     } catch (e) {
-      await kvb.delete(k.name).catch(() => {});
+      await kvb.delete(name).catch(() => {});
     }
   }));
 }

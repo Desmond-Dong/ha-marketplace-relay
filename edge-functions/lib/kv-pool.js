@@ -47,17 +47,29 @@ export function poolIdOf(key) {
 // Load every pool record. The pool is small by design (human-shared tokens),
 // so a full scan per pick is acceptable and keeps dedupe/revalidation simple.
 // 读取全部池记录。池子天然小（人工分享的 token），全量扫描即可，去重与验活都简单。
+//
+// NOTE: per Tencent Cloud docs (Makers KV API), list() returns ListKey entries as
+// { key: String } — the `.name` field seen in some third-party docs does not exist
+// in the real runtime; both spellings are accepted defensively.
+// A stored record MUST be readable: a failed get propagates loudly (callers surface
+// the error) instead of being skipped — silently dropping rows is what masked the
+// key-shape bug in the first place.
+// 注意：腾讯云官方文档（Makers KV API）中 list() 返回的 ListKey 是 { key: String }——
+// 部分第三方文档写的 .name 字段在真实运行时不存在，这里两种写法都兼容防御。
+// 已入库的记录必须可读：get 失败就大声抛出（由调用方呈现错误），绝不静默跳过——
+// 正是「有错就跳过」把键形状 bug 掩盖了的。
 export async function loadPool(kvb) {
   const entries = [];
   let cursor;
   do {
     const page = await kvb.list({ prefix: POOL_PREFIX, limit: 256, cursor });
     if (page && Array.isArray(page.keys) && page.keys.length) {
-      const vals = await Promise.all(page.keys.map((k) => kvb.get(k.name, 'json')));
-      page.keys.forEach((k, i) => {
+      const names = page.keys.map((k) => (k && (k.key || k.name)) || null).filter(Boolean);
+      const vals = await Promise.all(names.map((name) => kvb.get(name, 'json')));
+      names.forEach((name, i) => {
         const rec = vals[i];
         if (rec && typeof rec === 'object') {
-          entries.push({ key: k.name, id: poolIdOf(k.name), rec });
+          entries.push({ key: name, id: poolIdOf(name), rec });
         }
       });
     }
