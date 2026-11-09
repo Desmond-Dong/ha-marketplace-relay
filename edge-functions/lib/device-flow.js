@@ -36,6 +36,23 @@ function err(status, code) {
   return json(status, { error: code });
 }
 
+// EdgeOne egress to github.com is intermittently unreachable (observed ~40% hard failures
+// on /login/device/code). A single retry turns those into rare events without masking real
+// 4xx answers from GitHub. / EdgeOne 出口到 github.com 偶发不可达（实测 /login/device/code
+// 约 40% 直接失败）。单次重试把偶发失败降为罕见事件，也不会掩盖 GitHub 真正的 4xx。
+async function githubFetch(url, init) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await fetch(url, init);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 120 * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
 async function readJsonBody(request) {
   try {
     const data = await request.json();
@@ -164,7 +181,7 @@ export async function startDeviceFlow(request, env) {
 
   let res;
   try {
-    res = await fetch(GITHUB_DEVICE_CODE_URL, {
+    res = await githubFetch(GITHUB_DEVICE_CODE_URL, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -262,7 +279,7 @@ export async function pollDeviceFlow(request, env) {
 
   let res;
   try {
-    res = await fetch(GITHUB_TOKEN_URL, {
+    res = await githubFetch(GITHUB_TOKEN_URL, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -307,7 +324,7 @@ export async function pollDeviceFlow(request, env) {
   let login = null;
   let avatarUrl = null;
   try {
-    const ures = await fetch(GITHUB_USER_URL, {
+    const ures = await githubFetch(GITHUB_USER_URL, {
       headers: {
         authorization: `Bearer ${data.access_token}`,
         accept: 'application/vnd.github+json',
