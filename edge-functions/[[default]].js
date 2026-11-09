@@ -80,6 +80,10 @@ function blockedFileRequest(pathname) {
 // Marketplace 安装只有少量 API 调用加一次归档下载，600 远高于真实客户端，足以拦脚本刷量
 const RATE_LIMIT_WINDOW_MS = 3600 * 1000;
 const RATE_LIMIT_MAX = 600;
+// Upper bound for a body that goes through the Blob cache path / 走 Blob 缓存路径的 body 体积上限
+// Buffering above this blows the edge function memory budget (observed 504 on a 19 MB zip).
+// 超过该值的缓冲会超边缘函数内存预算（19MB zip 实测 504）。
+const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 const rateBuckets = new Map(); // ip -> [timestamps]
 function rateLimited(ip) {
   const now = Date.now();
@@ -165,7 +169,15 @@ export async function onRequest(context) {
   // (the catch-all below only handles /https://... prefixed proxy requests)
   // 看起来是页面的非代理路径继续走静态资源（下方 catch-all 只处理 /https://… 前缀的代理请求）
   if (!/^https?:/i.test(url.pathname.slice(1))) {
-    return context.next();
+    // context.next() throws when no static asset matches (EdgeOne returns 545 / "Error return
+    // from script"); turn that into a clean 404 instead of a fake function error.
+    // context.next() 在无匹配静态资源时会抛错（EdgeOne 返回 545 / "Error return from script"），
+    // 这里兜底成正常 404，避免把不存在的路径伪装成函数故障。
+    try {
+      return await context.next();
+    } catch (e) {
+      return jsonError(404, 'not found');
+    }
   }
 
   // UA whitelist check / UA 白名单校验
@@ -343,23 +355,39 @@ export async function onRequest(context) {
 
   // Stream the body through: function CPU doesn't grow with size (CPU limit excludes I/O wait)
   // 流式透传 body：函数 CPU 不随体积增长（CPU 限制不含 I/O 等待）
-  
+
+  // Blob write needs the whole body in memory first, so only small assets are cacheable;
+  // buffering a 19 MB release zip here blows the edge memory/CPU budget and the edge answers 504.
+  // Blob 写入必须先把整个 body 读进内存，因此只缓存小文件；把 19MB 的 release zip 缓冲下来
+  // 会超出边缘内存/CPU 预算，边缘直接返回 504（实测大文件全量下载 504、Range 流式 206 正常）。
+  const contentLength = Number(upstream.headers.get('content-length') || 0);
+  const cacheable = cacheEnabled && !hasRange && !cachedResult
+    && upstream.status >= 200 && upstream.status < 300
+    && contentLength > 0 && contentLength <= MAX_CACHE_BYTES;
+
   // If cacheable and successful, write to Blob / 可缓存且成功时写入 Blob
-  if (cacheEnabled && !hasRange && !cachedResult && upstream.status >= 200 && upstream.status < 300) {
+  if (cacheable) {
     const contentType = resHeaders.get('content-type') || 'application/octet-stream';
-    const bodyBuffer = await upstream.arrayBuffer();
-    
+    let bodyBuffer;
+    try {
+      bodyBuffer = await upstream.arrayBuffer();
+    } catch (e) {
+      // Buffer read failed → cannot cache, and the body is already consumed; report upstream error
+      // 缓冲读取失败 → 无法缓存，body 也已被消费，按上游错误返回
+      return jsonError(502, 'upstream error');
+    }
+
     // Write to cache (non-blocking, failure doesn't affect response)
     // 写入缓存（非阻塞，失败不影响响应）
     setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
-    
+
     resHeaders.set('x-cache', 'MISS');
     return new Response(bodyBuffer, {
       status: upstream.status,
       headers: resHeaders,
     });
   }
-  
+
   return new Response(upstream.body, {
     status: upstream.status,
     headers: resHeaders,
