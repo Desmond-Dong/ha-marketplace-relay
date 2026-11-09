@@ -377,9 +377,10 @@ export async function onRequest(context) {
       return jsonError(502, 'upstream error');
     }
 
-    // Write to cache (non-blocking, failure doesn't affect response)
-    // 写入缓存（非阻塞，失败不影响响应）
-    setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
+    // Write to cache before responding: a fire-and-forget write is dropped when the edge
+    // freezes the function right after the response is sent (observed: MISS on every request).
+    // 响应前完成写入：fire-and-forget 的写会在响应发出后函数被冻结时丢失（实测每次都是 MISS）
+    await setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
 
     resHeaders.set('x-cache', 'MISS');
     return new Response(bodyBuffer, {
