@@ -19,6 +19,13 @@ import { poolKv, insertPoolRecord, listKeyNames, SESS_PREFIX } from './kv-pool.j
 
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+
+// start retry budget: total wall time and per-attempt cap. Edge nodes tolerate
+// 15s+ of waiting (observed), so ~22s total stays clear of platform limits.
+// start 重试预算：总时长与单次上限。实测边缘节点可等待 15 秒以上，
+// 总预算 22 秒不会触到平台限制。
+const DEV_START_BUDGET_MS = 22000;
+const DEV_START_ATTEMPT_MS = 7000;
 const GITHUB_USER_URL = 'https://api.github.com/user';
 
 const jsonHeaders = {
@@ -40,6 +47,20 @@ function err(status, code) {
 // on /login/device/code). A single retry turns those into rare events without masking real
 // 4xx answers from GitHub. / EdgeOne 出口到 github.com 偶发不可达（实测 /login/device/code
 // 约 40% 直接失败）。单次重试把偶发失败降为罕见事件，也不会掩盖 GitHub 真正的 4xx。
+// Fetch that cannot hang past `ms`: the egress to github.com occasionally stalls
+// 15s+; without a per-attempt cap one hung request would eat the whole retry budget.
+// 单次限时 fetch：出口到 github.com 偶发挂起 15 秒以上，不设单次上限的话，
+// 一次挂起就会吃光全部重试预算。
+async function fetchWithTimeout(url, init, ms) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function githubFetch(url, init) {
   let lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -213,28 +234,55 @@ export async function startDeviceFlow(request, env) {
     return err(429, 'too many requests');
   }
 
-  let res;
-  try {
-    res = await githubFetch(GITHUB_DEVICE_CODE_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        'user-agent': 'HomeAssistantMarketplace',
-      },
-      body: JSON.stringify({ client_id: clientId, scope: '' }), // zero scope / 零权限
-    });
-  } catch (e) {
-    console.warn(`[${id}] device start fetch failed: ${e && e.message}`);
-    return err(502, 'upstream error');
+  // Keep retrying until a code is in hand (or the budget runs out): the visitor must
+  // not be turned into the retry mechanism. start is a one-shot action with no
+  // polling fallback — if it gives up, the whole flow dies with a silent button.
+  // 持续重试直到拿到码（或预算耗尽）：不能把访客当成重试机制。start 是一次性动作，
+  // 没有轮询兜底——这里一放弃，整个流程就死在一个安静的按钮上。
+  const attemptStart = () => fetchWithTimeout(GITHUB_DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+      'user-agent': 'HomeAssistantMarketplace',
+    },
+    body: JSON.stringify({ client_id: clientId, scope: '' }), // zero scope / 零权限
+  }, DEV_START_ATTEMPT_MS);
+
+  const deadline = Date.now() + DEV_START_BUDGET_MS;
+  let data = null;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    let res = null;
+    try {
+      res = await attemptStart();
+    } catch (e) {
+      res = null; // network stall/abort / 网络挂起或中断
+    }
+    if (res && res.ok) {
+      try {
+        const j = await res.json();
+        if (j && j.device_code && j.user_code) { data = j; break; }
+      } catch (e) { /* malformed body: retry / 响应体异常：重试 */ }
+    } else if (res) {
+      // 401/403 means the app credentials are wrong — retrying cannot fix that.
+      // 401/403 说明应用凭据有误，重试解决不了，直接失败。
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[${id}] device start upstream ${res.status} (credentials), giving up`);
+        if (res.body) { try { await res.body.cancel(); } catch (e) {} }
+        return err(502, 'upstream error');
+      }
+      console.warn(`[${id}] device start upstream ${res.status}, attempt ${attempts}`);
+      if (res.body) { try { await res.body.cancel(); } catch (e) {} }
+    } else {
+      console.warn(`[${id}] device start network stall, attempt ${attempts}`);
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, Math.min(1500, 250 * attempts)));
   }
-  if (!res.ok) {
-    console.warn(`[${id}] device start upstream ${res.status}`);
-    return err(502, 'upstream error');
-  }
-  const data = await res.json();
-  if (!data || !data.device_code || !data.user_code) {
-    console.warn(`[${id}] device start malformed response`);
+  if (!data) {
+    console.warn(`[${id}] device start exhausted budget (${attempts} attempts)`);
     return err(502, 'upstream error');
   }
 

@@ -104,8 +104,8 @@ btn.addEventListener('click', async () => {
     // 如实提示而不是按钮静默无反应，并恢复按钮让访客重试。
     btn.disabled = false;
     finalEl.className = 'status';
-    finalEl.innerHTML = '暂时拿不到授权码（GitHub 连接不稳定），请再点一次。'
-      + '<span class="step-en">Could not get a code right now (unstable connection to GitHub) — please try again.</span>';
+    finalEl.innerHTML = 'GitHub 连接持续不稳定，暂时拿不到授权码，请稍后再试。'
+      + '<span class="step-en">GitHub keeps timing out — no code right now, please try again later.</span>';
   }
 });
 
