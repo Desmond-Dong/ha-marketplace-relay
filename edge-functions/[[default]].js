@@ -139,6 +139,27 @@ function withCors(headers) {
 }
 
 export async function onRequest(context) {
+  // Any uncaught throw surfaces as EdgeOne's opaque 545 "Error return from script",
+  // which hides the real cause from clients and logs alike. Everything runs inside
+  // handleRequest; failures become a plain 502 instead.
+  // 任何未捕获异常都会变成 EdgeOne 那个不透明的 545「Error return from script」，
+  // 客户端和日志都看不到真实原因。全部逻辑放进 handleRequest，失败统一成 502。
+  try {
+    return await handleRequest(context);
+  } catch (e) {
+    // TEMP DIAG: surface the real error when the caller sends x-diag: 1
+    // 临时诊断：请求带 x-diag: 1 时返回真实错误
+    if (context.request.headers.get('x-diag') === '1') {
+      return new Response(JSON.stringify({
+        msg: String(e && e.message),
+        stack: String(e && e.stack || '').split('\n').slice(0, 8),
+      }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    return jsonError(502, 'upstream error');
+  }
+}
+
+async function handleRequest(context) {
   const { request, env, params } = context;
   const url = new URL(request.url);
 
