@@ -72,34 +72,32 @@ function loginKey(login, attempt) {
   return h1.toString(36) + h2.toString(36);
 }
 
-// Load every pool record. The pool is small by design (human-shared tokens),
-// so a full scan per pick is acceptable and keeps dedupe/revalidation simple.
-// 读取全部池记录。池子天然小（人工分享的 token），全量扫描即可，去重与验活都简单。
-//
-// NOTE: per Tencent Cloud docs (Makers KV API), list() returns ListKey entries as
-// { key: String } — the `.name` field seen in some third-party docs does not exist
-// in the real runtime; both spellings are accepted defensively.
-// A stored record MUST be readable: a failed get propagates loudly (callers surface
-// the error) instead of being skipped — silently dropping rows is what masked the
-// key-shape bug in the first place.
-// 注意：腾讯云官方文档（Makers KV API）中 list() 返回的 ListKey 是 { key: String }——
-// 部分第三方文档写的 .name 字段在真实运行时不存在，这里两种写法都兼容防御。
-// 已入库的记录必须可读：get 失败就大声抛出（由调用方呈现错误），绝不静默跳过——
-// 正是「有错就跳过」把键形状 bug 掩盖了的。
-export async function loadPool(kvb) {
-  const entries = [];
+// Enumerate key names under a prefix, working around a confirmed runtime quirk:
+// list() WITH a prefix returns a result WITHOUT the keys array (verified live via
+// /api/kv-diag); only option-less list() returns keys. Strategy: try prefix mode on
+// the first page; when keys are missing, redo — and continue — without a prefix,
+// filtering in JS. The mode locks for the whole pagination because the two cursors
+// are not interchangeable. Works with both documented ListKey shapes (key/name).
+// 枚举某前缀下的键名，规避实测确认的运行时 quirk：带 prefix 的 list() 返回值里没有
+// keys 数组（经 /api/kv-diag 线上确认）；只有不带参数的 list() 才返回 keys。策略：
+// 第一页先试 prefix 模式，缺 keys 就退回无 prefix 分页 + JS 侧过滤。模式在第一页
+// 锁定整轮保持（两种游标不通用）。兼容文档里的两种 ListKey 形状（key/name）。
+export async function listKeyNames(kvb, prefix) {
+  const names = [];
   let cursor;
+  let mode = 'auto';
   do {
-    const page = await kvb.list({ prefix: POOL_PREFIX, limit: 256, cursor });
-    if (page && Array.isArray(page.keys) && page.keys.length) {
-      const names = page.keys.map((k) => (k && (k.key || k.name)) || null).filter(Boolean);
-      const vals = await Promise.all(names.map((name) => kvb.get(name, 'json')));
-      names.forEach((name, i) => {
-        const rec = vals[i];
-        if (rec && typeof rec === 'object') {
-          entries.push({ key: name, id: poolIdOf(name), rec });
-        }
-      });
+    let page = await kvb.list(mode === 'noprefix' ? { limit: 256, cursor } : { prefix, limit: 256, cursor });
+    let rawKeys = page && Array.isArray(page.keys) ? page.keys : null;
+    if (mode === 'auto' && !rawKeys) {
+      mode = 'noprefix';
+      page = await kvb.list({ limit: 256, cursor });
+      rawKeys = page && Array.isArray(page.keys) ? page.keys : [];
+    }
+    if (mode === 'auto') mode = 'prefix';
+    for (const k of rawKeys || []) {
+      const n = (k && (k.key || k.name)) || null;
+      if (n && (mode === 'prefix' || n.startsWith(prefix))) names.push(n);
     }
     // cursor is the first key of the next page per the docs, null when complete;
     // requiring a truthy cursor guards against a platform quirk looping forever.
@@ -107,6 +105,28 @@ export async function loadPool(kvb) {
     // 行为异常时死循环。
     cursor = page && !page.complete && page.cursor ? page.cursor : undefined;
   } while (cursor);
+  return names;
+}
+
+// Load every pool record. The pool is small by design (human-shared tokens),
+// so a full scan per pick is acceptable and keeps dedupe/revalidation simple.
+// A stored record MUST be readable: a failed get propagates loudly (callers surface
+// the error) instead of being skipped — silently dropping rows is what masked the
+// key-shape bug in the first place.
+// 读取全部池记录。池子天然小（人工分享的 token），全量扫描即可，去重与验活都简单。
+// 已入库的记录必须可读：get 失败就大声抛出（由调用方呈现错误），绝不静默跳过——
+// 正是「有错就跳过」把键形状 bug 掩盖了的。
+export async function loadPool(kvb) {
+  const names = await listKeyNames(kvb, POOL_PREFIX);
+  if (!names.length) return [];
+  const vals = await Promise.all(names.map((name) => kvb.get(name, 'json')));
+  const entries = [];
+  names.forEach((name, i) => {
+    const rec = vals[i];
+    if (rec && typeof rec === 'object') {
+      entries.push({ key: name, id: poolIdOf(name), rec });
+    }
+  });
   return entries;
 }
 

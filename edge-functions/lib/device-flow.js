@@ -15,7 +15,7 @@
 // `marketplace`, deduped by login) — see lib/kv-pool.js.
 // 成功后 token 落入自建 KV 池（命名空间 marketplace，按 login 去重）——见 lib/kv-pool.js。
 
-import { poolKv, insertPoolRecord, SESS_PREFIX } from './kv-pool.js';
+import { poolKv, insertPoolRecord, listKeyNames, SESS_PREFIX } from './kv-pool.js';
 
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
@@ -123,18 +123,17 @@ async function sessDelete(key) {
   return DEVFLOW_MEM.delete(key);
 }
 
-// Opportunistic sweep: ~5% of starts scan one page of KV sessions and drop expired
-// ones, so abandoned flows don't accumulate (KV has no TTL). / 机会式清扫：约 5% 的
-// start 会扫描一页 KV 会话并删除过期条目，避免被放弃的流程堆积（KV 无 TTL）。
+// Opportunistic sweep: ~5% of starts scan KV sessions and drop expired ones, so
+// abandoned flows don't accumulate (KV has no TTL). Uses the prefix-quirk-safe
+// listKeyNames helper. / 机会式清扫：约 5% 的 start 会扫描 KV 会话并删除过期条目，
+// 避免被放弃的流程堆积（KV 无 TTL）。使用规避 prefix quirk 的 listKeyNames。
 async function sweepSessions() {
   const kvb = poolKv();
   if (!kvb) return;
-  const page = await kvb.list({ prefix: SESS_PREFIX, limit: 256 });
-  if (!page || !Array.isArray(page.keys) || !page.keys.length) return;
+  const names = await listKeyNames(kvb, SESS_PREFIX);
+  if (!names.length) return;
   const now = Date.now();
-  await Promise.all(page.keys.map(async (k) => {
-    const name = (k && (k.key || k.name)) || null; // ListKey.key per Tencent docs / 腾讯官方文档 ListKey.key
-    if (!name) return;
+  await Promise.all(names.map(async (name) => {
     try {
       const raw = await kvb.get(name, 'text');
       const p = raw ? JSON.parse(raw) : null;
