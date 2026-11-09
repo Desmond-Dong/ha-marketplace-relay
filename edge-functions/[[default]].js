@@ -18,7 +18,6 @@
 import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
 import { getTokenRecord, getPoolStats } from './lib/pool-api.js';
-import { poolDiag } from './lib/kv-pool.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -162,14 +161,6 @@ export async function onRequest(context) {
   }
   if (url.pathname === '/api/token/stats' && request.method === 'GET') {
     return getPoolStats(env);
-  }
-  // TEMPORARY admin-key-guarded KV diagnostics — remove with poolDiag once healthy.
-  // 临时 admin key 保护的 KV 诊断——恢复健康后连同 poolDiag 一起删除。
-  if (url.pathname === '/api/kv-diag' && request.method === 'GET') {
-    const key = (request.headers.get('x-admin-key') || new URL(request.url).searchParams.get('key') || '');
-    const expected = env && env.POOL_ADMIN_KEY ? String(env.POOL_ADMIN_KEY) : null;
-    if (!expected || key !== expected) return new Response(JSON.stringify({ error: 'not allowed' }), { status: 403, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify(await poolDiag()), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
   }
 
   // Non-proxy paths that look like pages should fall through to static assets

@@ -92,16 +92,16 @@ export async function listKeyNames(kvb, prefix) {
     // misbehaves, bail out with whatever was collected. / 硬性翻页上限：6 条记录的池
     // 绝不允许无限翻页——平台行为异常时带着已收集的结果退出。
     if (++pages > 10) break;
-    // Live-probed runtime contract (see poolDiag): list options must NOT carry a
-    // cursor key with an undefined value — the runtime strict-checks it and throws
-    // "cursor type invalid. expect: 'string' get: 'undefined'". First page omits the
-    // key entirely; only a non-empty string cursor from the previous page is sent.
-    // cursor is empty-string when complete. Key elements are objects ({key} per the
-    // teo docs) but bare strings are accepted too.
-    // 线上实锤的运行时契约（见 poolDiag）：list 选项绝不能带值为 undefined 的 cursor
-    // 键——运行时严格校验直接抛 "cursor type invalid. expect: 'string' get:
-    // 'undefined'"。首页完全不带该键；仅当上一页返回非空字符串 cursor 才续传。遍历
-    // 完成时 cursor 为空字符串。键元素是对象（teo 文档的 {key}），裸字符串也兼容。
+    // Live-probed runtime contract: list options must NOT carry a cursor key with an
+    // undefined value — the runtime strict-checks it and throws "cursor type invalid.
+    // expect: 'string' get: 'undefined'". First page omits the key entirely; only a
+    // non-empty string cursor from the previous page is sent. cursor is empty-string
+    // when complete. Key elements are objects ({key} per the teo docs) but bare
+    // strings are accepted too.
+    // 线上实锤的运行时契约：list 选项绝不能带值为 undefined 的 cursor 键——运行时严格
+    // 校验直接抛 "cursor type invalid. expect: 'string' get: 'undefined'"。首页完全
+    // 不带该键；仅当上一页返回非空字符串 cursor 才续传。遍历完成时 cursor 为空字符串。
+    // 键元素是对象（teo 文档的 {key}），裸字符串也兼容。
     const opts = mode === 'noprefix' ? { limit: 256 } : { prefix, limit: 256 };
     if (cursor) opts.cursor = cursor;
     let page = await kvb.list(opts);
@@ -116,9 +116,9 @@ export async function listKeyNames(kvb, prefix) {
     if (mode === 'auto') mode = 'prefix';
     for (const k of rawKeys || []) {
       // Accept every observed key shape: bare string, {key}, {name}. A shape this
-      // code does not understand is recorded as '?' and kept visible in poolDiag
-      // instead of silently vanishing. / 接受所有已观测键形状：裸字符串、{key}、
-      // {name}。无法识别的形状记为 '?' 并在 poolDiag 里可见，绝不静默消失。
+      // code does not understand is recorded as '?' and skipped in loadPool instead
+      // of silently vanishing. / 接受所有已观测键形状：裸字符串、{key}、{name}。
+      // 无法识别的形状记为 '?' 由 loadPool 跳过，绝不静默消失。
       let n = null;
       if (typeof k === 'string') n = k;
       else if (k && typeof k.key === 'string') n = k.key;
@@ -145,7 +145,7 @@ export async function loadPool(kvb) {
   const names = await listKeyNames(kvb, POOL_PREFIX);
   if (!names.length) return [];
   const vals = await Promise.all(names.map(async (name) => {
-    if (name === '?') return undefined; // unknown shape: surfaced via poolDiag / 未知形状：交给 poolDiag 呈现
+    if (name === '?') return undefined; // unknown key shape: skip / 未知键形状：跳过
     // get() type variants differ across runtime versions; try both. / get() 的类型参数形态因运行时版本而异，两种都试。
     try {
       return await kvb.get(name, 'json');
@@ -284,41 +284,4 @@ export function toTokenhubShape(id, rec) {
     usage: rec.usage || null,
     usages: null,
   };
-}
-
-// ---- diagnostics (admin-key guarded, temporary) / 诊断（admin key 保护，临时）----
-// Dumps shape-only facts about the KV binding: binding presence, per-style list()
-// results (key NAMES only, never values), loadPool() outcome with the exact error.
-// Needed because the runtime KV behavior differs from the docs and only live probes
-// settle it. Remove once /api/token/stats is healthy.
-// 只输出 KV 绑定的形状事实：绑定是否存在、各调用形态的 list() 结果（仅键名，绝不含
-// 值）、loadPool() 的结果与确切错误。运行时 KV 行为与文档不一致，只有线上探针能定
-// 分晓。/api/token/stats 恢复健康后删除本段。
-export async function poolDiag() {
-  const out = { binding: {}, list: {}, loadPool: null };
-  const kvb = poolKv();
-  out.binding.resolved = kvb ? (typeof marketplace !== 'undefined' ? 'marketplace' : 'TOKENPOOL_KV') : null;
-  if (!kvb) return out;
-  for (const [name, arg] of [['noargs', undefined], ['limit', { limit: 20 }], ['prefix', { prefix: POOL_PREFIX, limit: 20 }]]) {
-    try {
-      const res = arg === undefined ? await kvb.list() : await kvb.list(arg);
-      const raw = res && Array.isArray(res.keys) ? res.keys : null;
-      out.list[name] = {
-        has_keys: raw !== null,
-        key_types: raw ? [...new Set(raw.map((k) => Array.isArray(k) ? 'array' : typeof k))] : null,
-        names: raw ? raw.slice(0, 20).map((k) => typeof k === 'string' ? k : (k && (k.key || k.name)) || '?') : null,
-        complete: res && res.complete,
-        cursor: res && res.cursor != null ? String(res.cursor).slice(0, 24) : null,
-      };
-    } catch (e) {
-      out.list[name] = { error: String(e && e.message || e) };
-    }
-  }
-  try {
-    const entries = await loadPool(kvb);
-    out.loadPool = { ok: true, count: entries.length, keys: entries.map((e) => e.key), logins: entries.map((e) => e.rec && e.rec.login || '?') };
-  } catch (e) {
-    out.loadPool = { ok: false, error: String(e && e.message || e) };
-  }
-  return out;
 }
