@@ -18,6 +18,7 @@
 import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
 import { getPoolStats } from './lib/pool-api.js';
+import { getCached, setCached, shouldCache, cacheKey } from './lib/blob-cache.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -220,6 +221,29 @@ export async function onRequest(context) {
   // Never forward proxy-internal params upstream / 代理内部参数不透传给上游
   target.searchParams.delete('key');
 
+  // Blob cache: check if this request should be cached / Blob 缓存：检查是否应缓存此请求
+  const cacheEnabled = shouldCache(target.toString());
+  const rangeHeader = request.headers.get('range');
+  const hasRange = !!rangeHeader;
+  
+  let cachedResult = null;
+  if (cacheEnabled && !hasRange) {
+    // Only cache full requests (no Range header)
+    // 只缓存完整请求（无 Range 头）
+    cachedResult = await findCached(target.toString());
+    if (cachedResult) {
+      // Cache hit / 缓存命中
+      const resHeaders = new Headers();
+      resHeaders.set('content-type', cachedResult.data.contentType || 'application/octet-stream');
+      resHeaders.set('x-cache', 'HIT');
+      withCors(resHeaders);
+      return new Response(cachedResult.data.body, {
+        status: 200,
+        headers: resHeaders,
+      });
+    }
+  }
+
   // ---- Upstream request headers / 构造上游请求头 ----
   const headers = new Headers();
   for (const [k, v] of request.headers.entries()) {
@@ -319,6 +343,23 @@ export async function onRequest(context) {
 
   // Stream the body through: function CPU doesn't grow with size (CPU limit excludes I/O wait)
   // 流式透传 body：函数 CPU 不随体积增长（CPU 限制不含 I/O 等待）
+  
+  // If cacheable and successful, write to Blob / 可缓存且成功时写入 Blob
+  if (cacheEnabled && !hasRange && !cachedResult && upstream.status >= 200 && upstream.status < 300) {
+    const contentType = resHeaders.get('content-type') || 'application/octet-stream';
+    const bodyBuffer = await upstream.arrayBuffer();
+    
+    // Write to cache (non-blocking, failure doesn't affect response)
+    // 写入缓存（非阻塞，失败不影响响应）
+    setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
+    
+    resHeaders.set('x-cache', 'MISS');
+    return new Response(bodyBuffer, {
+      status: upstream.status,
+      headers: resHeaders,
+    });
+  }
+  
   return new Response(upstream.body, {
     status: upstream.status,
     headers: resHeaders,

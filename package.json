@@ -1,0 +1,8 @@
+{
+  "name": "ha-marketplace-relay",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@edgeone/pages-blob": "^1.0.0"
+  }
+}
