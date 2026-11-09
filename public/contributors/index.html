@@ -55,7 +55,7 @@ function render(list) {
       ? '<span class="pill">可用</span><span class="step-en">Active</span>'
       : '<span class="pill low">已失效</span><span class="step-en">Inactive</span>';
     const rem = c.remaining == null ? '—' : String(c.remaining);
-    return '<tr><td>' + esc(c.login) + '</td><td>' + Number(c.use_count || 0) +
+    return '<tr><td><a href="https://github.com/' + esc(c.login) + '" target="_blank" rel="noopener noreferrer">' + esc(c.login) + '</a></td><td>' + Number(c.use_count || 0) +
       '</td><td>' + esc(rem) + '</td><td>' + pill + '</td></tr>';
   }).join('');
 }
