@@ -7,7 +7,6 @@
 //   /https://github.com/<owner>/<repo>/releases/...   -> release assets, follows 302 / release 资产（跟随 302）
 //   /https://raw.githubusercontent.com/<...>          -> repo files / 仓库文件
 //   /https://codeload.github.com/<...>                -> source archives / 源码包
-//   /https://gist.githubusercontent.com/<...>         -> gist files / gist 文件
 //
 // Auth / 鉴权: UA must contain HomeAssistantMarketplace; non-GitHub hosts rejected
 // UA 须含 HomeAssistantMarketplace；非 GitHub 域名拒绝
@@ -26,15 +25,19 @@ import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
 // Contents API on api.github.com (reachable; raw media type returns file bytes).
 // 注：EdgeOne 出口连不上 Fastly 托管的 raw.githubusercontent.com，
 // raw 路径自动改走 api.github.com 上的官方 Contents API（可达；raw 媒体类型返回文件本体）
+// Only the hosts the Marketplace flow actually touches. gist.github.com /
+// gist.githubusercontent.com are deliberately NOT allowed: HACS and the Marketplace
+// never fetch gists, and every host kept here is one more surface to reach through the
+// service. / 只保留 Marketplace 流程真正会用到的主机。gist.github.com /
+// gist.githubusercontent.com 刻意不放行：HACS 与 Marketplace 从不取用 gist，
+// 白名单里每多一个主机就多一块可被借道访问的面。
 const ALLOWED_HOSTS = new Set([
-  'api.github.com',
-  'github.com',
-  'www.github.com',
-  'raw.githubusercontent.com',
-  'codeload.github.com',
-  'gist.github.com',
-  'gist.githubusercontent.com',
-  'objects.githubusercontent.com',
+  'api.github.com',                  // API: repo metadata, releases
+  'github.com',                      // release download URLs (302 → asset CDN)
+  'www.github.com',                  // www alias some clients/build scripts use
+  'codeload.github.com',             // source archives
+  'raw.githubusercontent.com',       // repo files (remapped to the Contents API)
+  'objects.githubusercontent.com',   // release asset CDN
   'release-assets.githubusercontent.com',
 ]);
 
@@ -139,6 +142,27 @@ function withCors(headers) {
 }
 
 export async function onRequest(context) {
+  // Any uncaught throw surfaces as EdgeOne's opaque 545 "Error return from script",
+  // which hides the real cause from clients and logs alike. Everything runs inside
+  // handleRequest; failures become a plain 502 instead.
+  // 任何未捕获异常都会变成 EdgeOne 那个不透明的 545「Error return from script」，
+  // 客户端和日志都看不到真实原因。全部逻辑放进 handleRequest，失败统一成 502。
+  try {
+    return await handleRequest(context);
+  } catch (e) {
+    // TEMP DIAG: surface the real error when the caller sends x-diag: 1
+    // 临时诊断：请求带 x-diag: 1 时返回真实错误
+    if (context.request.headers.get('x-diag') === '1') {
+      return new Response(JSON.stringify({
+        msg: String(e && e.message),
+        stack: String(e && e.stack || '').split('\n').slice(0, 8),
+      }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    return jsonError(502, 'upstream error');
+  }
+}
+
+async function handleRequest(context) {
   const { request, env, params } = context;
   const url = new URL(request.url);
 
@@ -426,6 +450,36 @@ export async function onRequest(context) {
       status: upstream.status,
       headers: resHeaders,
     });
+  }
+
+  // Streaming a large upstream HTML body can die mid-flight on the EdgeOne egress
+  // (observed: github.com/large page → opaque 545 "script error" or 504, while API and
+  // asset downloads over the same path are fine). HTML pages are small, so buffer them:
+  // a broken read becomes a catchable error instead of a stream that dies after the
+  // response headers were already sent. Everything else keeps streaming.
+  // 大体积上游 HTML 的 body 流在 EdgeOne 出口可能中途断掉（实测 github.com/ 大页面 →
+  // 不透明 545「script error」或 504，而同链路的 API 与资产下载正常）。HTML 体积小，
+  // 改为整体缓冲：读取失败变成可捕获的错误，不再是响应头已发出后流才断。其余仍流式。
+  const contentType = (resHeaders.get('content-type') || '').toLowerCase();
+  const isHtml = contentType.includes('text/html');
+  const declaredLen = Number(upstream.headers.get('content-length') || 0);
+  const bufferHtml = isHtml && request.method !== 'HEAD' && declaredLen <= 4 * 1024 * 1024;
+
+  if (bufferHtml) {
+    try {
+      const buf = await upstream.arrayBuffer();
+      return new Response(buf, { status: upstream.status, headers: resHeaders });
+    } catch (e) {
+      // Retry the whole fetch once: the failure is usually a flaky egress socket.
+      // 整体重试一次：这类失败通常是出口连接抖动。
+      try {
+        const retry = await fetchUpstream(target, headers, request.method, undefined);
+        const buf2 = await retry.arrayBuffer();
+        return new Response(buf2, { status: retry.status, headers: resHeaders });
+      } catch (e2) {
+        return jsonError(502, 'upstream error');
+      }
+    }
   }
 
   return new Response(upstream.body, {
