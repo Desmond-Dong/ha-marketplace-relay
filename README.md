@@ -114,8 +114,10 @@ fetch and never affects download correctness.
   (`lib/github-token.js` → `pickTokenRecord`), so no HTTP surface can hand out tokens.
 - **`GET /api/token/stats`** returns masked pool stats (login / use count / last-known
   remaining quota / status) plus storage usage (record count / approximate bytes) for
-  the contributors page and the home page. No raw tokens; `remaining` is only present
-  within the freshness window and never shown stale. EdgeOne does not expose the real
+  the contributors page and the home page. No raw tokens; `remaining` is the last value
+  observed when the service actually used that token — it is never re-probed just to
+  render the table, so an idle service makes no API calls and the last known number
+  stays visible. EdgeOne does not expose the real
   KV quota to the runtime — set the `KV_QUOTA_MB` env var to the namespace's actual
   cap to get a percentage; without it only absolute usage is shown.
 
