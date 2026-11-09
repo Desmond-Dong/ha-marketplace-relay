@@ -17,6 +17,7 @@
 
 import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
+import { getTokenRecord, getPoolStats } from './lib/pool-api.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -149,6 +150,17 @@ export async function onRequest(context) {
   }
   if (url.pathname === '/share/device/poll' && request.method === 'POST') {
     return pollDeviceFlow(request, env);
+  }
+
+  // Shared-pool public API (moved out of api/ subdirectory files: the bundler cannot
+  // resolve '../../' imports there — handlers live in lib/pool-api.js; URLs unchanged)
+  // 共享池公开 API（从 api/ 子目录迁出：打包器无法解析那里的 '../../' 导入——处理器
+  // 在 lib/pool-api.js；URL 不变）
+  if (url.pathname === '/api/token/get' && request.method === 'GET') {
+    return getTokenRecord(env);
+  }
+  if (url.pathname === '/api/token/stats' && request.method === 'GET') {
+    return getPoolStats(env);
   }
 
   // Non-proxy paths that look like pages should fall through to static assets
