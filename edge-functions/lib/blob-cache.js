@@ -1,7 +1,18 @@
 // Blob 缓存层：缓存 release zip 等大文件，边缘节点加速读取
 // 全自动：满了删除最老的文件，无需人工干预
 
-import { getStore } from "@edgeone/pages-blob";
+// 延迟加载，避免模块加载失败导致整个函数崩溃
+let blobModule = null;
+async function getBlobModule() {
+  if (!blobModule) {
+    try {
+      blobModule = await import("@edgeone/pages-blob");
+    } catch (e) {
+      return null;
+    }
+  }
+  return blobModule;
+}
 
 const STORE_NAME = "github-cache";
 const MAX_FILES = 50; // 最多缓存 50 个文件（按数量淘汰，因为 list 不返回 size）
@@ -18,7 +29,9 @@ async function urlHash(url) {
 // 查找已存在的缓存
 export async function findCached(url) {
   try {
-    const store = getStore(STORE_NAME);
+    const mod = await getBlobModule();
+    if (!mod) return null;
+    const store = mod.getStore(STORE_NAME);
     const hash = await urlHash(url);
     
     // 读取元数据
@@ -43,7 +56,9 @@ export async function findCached(url) {
 // 写入缓存（自动淘汰最老的）
 export async function setCached(bodyBuffer, contentType, url) {
   try {
-    const store = getStore(STORE_NAME);
+    const mod = await getBlobModule();
+    if (!mod) return false;
+    const store = mod.getStore(STORE_NAME);
     const hash = await urlHash(url);
     
     // 先淘汰，再写入
