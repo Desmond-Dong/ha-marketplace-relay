@@ -243,6 +243,7 @@ export async function pickTokenRecord(kvb, excludeTokens) {
     } else {
       const v = await revalidateQuota(raw);
       if (v.state === 'dead') {
+        console.warn('[kv] token dead (401/403), disabling record');
         // Revoked/invalid: mark disabled, prune from candidates. / 已吊销：标记停用，剔出候选。
         raw.disabled = true;
         raw.updated_at = nowStr();
@@ -250,6 +251,7 @@ export async function pickTokenRecord(kvb, excludeTokens) {
         continue;
       }
       if (v.state === 'unreachable') {
+        console.warn('[kv] revalidate unreachable, skipping this round');
         // Cannot verify right now: skip this round, keep the record as-is.
         // 暂时无法验证：本轮跳过，记录保持原状。
         continue;
@@ -264,7 +266,10 @@ export async function pickTokenRecord(kvb, excludeTokens) {
     }
     if (remaining > bestRemaining) { best = e; bestRemaining = remaining; }
   }
-  if (!best) return null;
+  if (!best) {
+    console.warn('[kv] pick: no usable token in pool');
+    return null;
+  }
   best.rec.use_count = (best.rec.use_count || 0) + 1;
   best.rec.updated_at = nowStr();
   await kvb.put(best.key, JSON.stringify(best.rec));
@@ -318,6 +323,7 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
       try {
         await kvb.put(key, JSON.stringify(rec));
       } catch (e) {
+        console.warn(`[kv] put failed (attempt ${write + 1}): ${e && e.message}`);
         if (write < 3) { await sleep(120 * (write + 1)); continue; }
         return { ok: false, reason: 'put failed' };
       }
@@ -331,12 +337,15 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
           back = null;
         }
         if (back && typeof back === 'object' && back.token === rec.token) {
+          console.log(`[kv] insert ok key=${key} reused=${!!prev} writes=${write + 1}`);
           return { ok: true, id: poolIdOf(key), reused: !!prev, key };
         }
       }
     }
+    console.warn('[kv] insert verify failed after retries');
     return { ok: false, reason: 'verify failed' };
   }
+  console.warn('[kv] key collision exhausted');
   return { ok: false, reason: 'key collision' };
 }
 

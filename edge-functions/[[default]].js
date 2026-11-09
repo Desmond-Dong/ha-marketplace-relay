@@ -147,9 +147,14 @@ export async function onRequest(context) {
   // handleRequest; failures become a plain 502 instead.
   // 任何未捕获异常都会变成 EdgeOne 那个不透明的 545「Error return from script」，
   // 客户端和日志都看不到真实原因。全部逻辑放进 handleRequest，失败统一成 502。
+  const id = rid();
+  const t0 = Date.now();
   try {
-    return await handleRequest(context);
+    const res = await handleRequest(context);
+    console.log(`[${id}] ${request.method} ${url.pathname} -> ${res.status} (${Date.now() - t0}ms)`);
+    return res;
   } catch (e) {
+    console.error(`[${id}] UNCAUGHT ${request.method} ${url.pathname}: ${e && e.message}\n${e && e.stack}`);
     // TEMP DIAG: surface the real error when the caller sends x-diag: 1
     // 临时诊断：请求带 x-diag: 1 时返回真实错误
     if (context.request.headers.get('x-diag') === '1') {
@@ -160,6 +165,15 @@ export async function onRequest(context) {
     }
     return jsonError(502, 'upstream error');
   }
+}
+
+// Log line with a short request id so the console can correlate entries.
+// 带短请求 id 的日志行，方便在控制台里对应同一请求的条目。
+function reqLog(rid, msg, extra) {
+  console.log(`[${rid}] ${msg}${extra ? ' ' + extra : ''}`);
+}
+function rid() {
+  return crypto.randomUUID().slice(0, 8);
 }
 
 async function handleRequest(context) {
@@ -207,12 +221,14 @@ async function handleRequest(context) {
   // UA whitelist check / UA 白名单校验
   const ua = request.headers.get('user-agent') || '';
   if (!ALLOWED_UA_SUBSTRINGS.some((s) => ua.includes(s))) {
+    reqLog(id, 'reject UA', url.pathname);
     return jsonError(403, 'not allowed');
   }
 
   // Per-IP rate limit / 每 IP 限流（UA 门禁之后，只限通过门禁的代理请求）
   const clientIp = request.headers.get('x-forwarded-for') || request.headers.get('eo-connecting-ip') || 'unknown';
   if (rateLimited(clientIp)) {
+    reqLog(id, 'rate limited', clientIp);
     return jsonError(429, 'too many requests');
   }
 
@@ -272,6 +288,7 @@ async function handleRequest(context) {
       const resHeaders = new Headers();
       resHeaders.set('content-type', cachedResult.contentType || 'application/octet-stream');
       resHeaders.set('x-cache', 'HIT');
+      reqLog(id, 'cache HIT', target.pathname);
       withCors(resHeaders);
       return new Response(cachedResult.body, {
         status: 200,
@@ -385,6 +402,7 @@ async function handleRequest(context) {
     // Drain the rejected body so the connection can be reused. / 丢弃被拒响应的 body 以复用连接。
     if (upstream.body) { try { await upstream.body.cancel(); } catch (e) {} }
     rejectedTokens.add(usedToken);
+    console.warn(`[${id}] token rejected (${upstream.status}), rotating`, `tried=${rejectedTokens.size}`);
     invalidateGithubToken(upstream.status, context);
   }
   if (!upstream) return jsonError(502, 'upstream error');
@@ -446,6 +464,7 @@ async function handleRequest(context) {
     await setCached(bodyBuffer, contentType, target.toString()).catch(() => {});
 
     resHeaders.set('x-cache', 'MISS');
+    reqLog(id, 'cache MISS -> stored', `${contentLength}B ${target.pathname}`);
     return new Response(bodyBuffer, {
       status: upstream.status,
       headers: resHeaders,

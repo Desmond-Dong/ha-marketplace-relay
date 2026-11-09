@@ -19,6 +19,14 @@ import { poolKv, insertPoolRecord, listKeyNames, SESS_PREFIX } from './kv-pool.j
 
 const GITHUB_DEVICE_CODE_URL = 'https://github.com/login/device/code';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
+
+// start retry budget: per-attempt cap 3s (a healthy handshake answers in ~1s;
+// anything longer is a stalled connection worth abandoning) and ~22s total, which
+// stays clear of observed edge-node waiting tolerance.
+// start 重试预算：单次上限 3 秒（健康握手约 1 秒内应答，超过就是值得放弃的挂起连接）；
+// 总预算约 22 秒，不触碰实测的边缘节点等待上限。
+const DEV_START_BUDGET_MS = 22000;
+const DEV_START_ATTEMPT_MS = 3000;
 const GITHUB_USER_URL = 'https://api.github.com/user';
 
 const jsonHeaders = {
@@ -40,6 +48,20 @@ function err(status, code) {
 // on /login/device/code). A single retry turns those into rare events without masking real
 // 4xx answers from GitHub. / EdgeOne 出口到 github.com 偶发不可达（实测 /login/device/code
 // 约 40% 直接失败）。单次重试把偶发失败降为罕见事件，也不会掩盖 GitHub 真正的 4xx。
+// Fetch that cannot hang past `ms`: the egress to github.com occasionally stalls
+// 15s+; without a per-attempt cap one hung request would eat the whole retry budget.
+// 单次限时 fetch：出口到 github.com 偶发挂起 15 秒以上，不设单次上限的话，
+// 一次挂起就会吃光全部重试预算。
+async function fetchWithTimeout(url, init, ms) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function githubFetch(url, init) {
   let lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -195,6 +217,7 @@ async function sweepSessions() {
 }
 
 export async function startDeviceFlow(request, env) {
+  const id = crypto.randomUUID().slice(0, 8);
   const clientId = env && env.Client_ID;
   const clientSecret = env && env.Client_Secret;
   if (!clientId || !clientSecret) {
@@ -212,25 +235,55 @@ export async function startDeviceFlow(request, env) {
     return err(429, 'too many requests');
   }
 
-  let res;
-  try {
-    res = await githubFetch(GITHUB_DEVICE_CODE_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json',
-        'user-agent': 'HomeAssistantMarketplace',
-      },
-      body: JSON.stringify({ client_id: clientId, scope: '' }), // zero scope / 零权限
-    });
-  } catch (e) {
-    return err(502, 'upstream error');
+  // Keep retrying until a code is in hand (or the budget runs out): the visitor must
+  // not be turned into the retry mechanism. start is a one-shot action with no
+  // polling fallback — if it gives up, the whole flow dies with a silent button.
+  // 持续重试直到拿到码（或预算耗尽）：不能把访客当成重试机制。start 是一次性动作，
+  // 没有轮询兜底——这里一放弃，整个流程就死在一个安静的按钮上。
+  const attemptStart = () => fetchWithTimeout(GITHUB_DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json',
+      'user-agent': 'HomeAssistantMarketplace',
+    },
+    body: JSON.stringify({ client_id: clientId, scope: '' }), // zero scope / 零权限
+  }, DEV_START_ATTEMPT_MS);
+
+  const deadline = Date.now() + DEV_START_BUDGET_MS;
+  let data = null;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    let res = null;
+    try {
+      res = await attemptStart();
+    } catch (e) {
+      res = null; // network stall/abort / 网络挂起或中断
+    }
+    if (res && res.ok) {
+      try {
+        const j = await res.json();
+        if (j && j.device_code && j.user_code) { data = j; break; }
+      } catch (e) { /* malformed body: retry / 响应体异常：重试 */ }
+    } else if (res) {
+      // 401/403 means the app credentials are wrong — retrying cannot fix that.
+      // 401/403 说明应用凭据有误，重试解决不了，直接失败。
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[${id}] device start upstream ${res.status} (credentials), giving up`);
+        if (res.body) { try { await res.body.cancel(); } catch (e) {} }
+        return err(502, 'upstream error');
+      }
+      console.warn(`[${id}] device start upstream ${res.status}, attempt ${attempts}`);
+      if (res.body) { try { await res.body.cancel(); } catch (e) {} }
+    } else {
+      console.warn(`[${id}] device start network stall, attempt ${attempts}`);
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, Math.min(1500, 250 * attempts)));
   }
-  if (!res.ok) {
-    return err(502, 'upstream error');
-  }
-  const data = await res.json();
-  if (!data || !data.device_code || !data.user_code) {
+  if (!data) {
+    console.warn(`[${id}] device start exhausted budget (${attempts} attempts)`);
     return err(502, 'upstream error');
   }
 
@@ -246,6 +299,7 @@ export async function startDeviceFlow(request, env) {
   }), Math.max(60, Math.min(900, Number(data.expires_in) || 900)));
   sweepSessions().catch(() => {});
 
+  console.log(`[${id}] device start ok`, `session=${sessionId.slice(0, 8)}…`);
   return json(200, {
     session: sessionId,
     user_code: data.user_code,
@@ -318,6 +372,7 @@ export async function pollDeviceFlow(request, env) {
   // code 有效期——那个期限只约束向 GitHub 取 token，token 已经在手。再问只会得到过期，
   // 授权就彻底丢了。
   if (parsed.access_token) {
+    console.log(`[poll] retry insert for session ${session.slice(0,8)}… attempt=${parsed.store_attempts || 1}`);
     return finishWithToken(session, parsed.access_token, parsed.login || null, parsed.avatar_url || null);
   }
 
@@ -385,7 +440,10 @@ export async function pollDeviceFlow(request, env) {
       login = u.login || null;
       avatarUrl = u.avatar_url || null;
     }
-  } catch (e) { /* fallthrough: login optional / login 拿不到不阻断 */ }
+  } catch (e) {
+    console.warn('[poll] /user lookup failed; storing without login attribution', e && e.message);
+    /* login optional / login 拿不到不阻断 */
+  }
   // A failed profile lookup is NOT proof the token is bad: EdgeOne egress to
   // api.github.com is intermittent, and the authorization the user just completed must
   // not be thrown away. Store it keyed by the token itself and let the pool attribute
@@ -422,6 +480,7 @@ async function finishWithToken(session, accessToken, login, avatarUrl) {
   }
 
   if (!inserted || !inserted.ok) {
+    console.warn(`[poll] insert failed (${(inserted && inserted.reason) || 'unknown'}), keeping session for retry`);
     // Keep the session and hand the token back for the retry: store it in the session
     // record so a later poll can insert without asking GitHub again.
     // 保留会话并把 token 暂存进会话记录，后续轮询可直接重试入库，无需再问 GitHub。
@@ -452,6 +511,7 @@ async function finishWithToken(session, accessToken, login, avatarUrl) {
     return json(200, { status: 'pending', storing: true });
   }
 
+  console.log(`[poll] stored ok`, `login=${login || 'unknown'} reused=${!!(inserted && inserted.reused)}`);
   await sessDelete(session).catch(() => {});
   sweepConsumed();
   consumedSessions.add(session);
