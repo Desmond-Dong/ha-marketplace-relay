@@ -97,7 +97,15 @@ btn.addEventListener('click', async () => {
     let interval = (d.interval || 5) * 1000;
     timer = setInterval(poll, interval);
   } catch (e) {
+    // Starting the flow needs a live call to github.com from the edge; when that
+    // upstream hop stalls/fails there is no code to show — tell the visitor plainly
+    // instead of a dead silent button, and re-enable for a retry.
+    // 发起流程需要边缘节点实时调用 github.com；上游这一跳卡住/失败就拿不到码。
+    // 如实提示而不是按钮静默无反应，并恢复按钮让访客重试。
     btn.disabled = false;
+    finalEl.className = 'status';
+    finalEl.innerHTML = '暂时拿不到授权码（GitHub 连接不稳定），请再点一次。'
+      + '<span class="step-en">Could not get a code right now (unstable connection to GitHub) — please try again.</span>';
   }
 });
 
