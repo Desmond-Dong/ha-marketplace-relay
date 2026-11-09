@@ -18,15 +18,19 @@
 // 存储用量直接由记录本身测得：记录条数 + 全部记录的估算字节数（键名 + JSON 值体）。
 // EdgeOne 不向运行时暴露平台级配额计数器，配额分母来自环境变量 KV_QUOTA_MB——
 // 在控制台把它设成命名空间的实际容量即可得到百分比；未设置时只返回绝对用量。
-// Response cached 60s: this endpoint is public and unauthenticated, caching spares
-// the KV read quota. / 响应缓存 60 秒：公开端点，用缓存省 KV 读配额。
 
 import { poolKv, loadPool, QUOTA_TTL_MS } from '../../lib/kv-pool.js';
 
+// Response must not be cached anywhere: a just-shared token has to show up on the
+// contributors page immediately (KV itself is eventually consistent, ≤60s — that
+// platform-side window is documented and unavoidable; an HTTP cache layer on top of
+// it would only add more delay). / 响应禁止任何缓存：刚入库的 token 必须尽快出现在
+// 贡献者页（KV 自身最终一致 ≤60 秒是平台文档行为、无法避免；上面再叠 HTTP 缓存只会
+// 徒增延迟）。
 const jsonHeaders = {
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': '*',
-  'cache-control': 'public, max-age=60',
+  'cache-control': 'no-store',
 };
 
 function json(status, payload) {

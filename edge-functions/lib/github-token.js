@@ -43,11 +43,11 @@ function markRejected() {
 //   401 → token 被吊销/失效：立刻在 KV 中停用该记录
 //   403 → 额度大概率耗尽：清保鲜期，下次选取强制重新验活
 //   （insertPoolRecord 的重复分享可复活已停用记录）
-export function invalidateGithubToken(status) {
+export function invalidateGithubToken(status, context) {
   const kvb = poolKv();
   if (kvb && tokenCache.poolKey) {
     const key = tokenCache.poolKey;
-    (async () => {
+    const writeback = (async () => {
       try {
         const raw = await kvb.get(key, 'json');
         if (!raw) return;
@@ -59,6 +59,12 @@ export function invalidateGithubToken(status) {
         // best-effort bookkeeping / 回写尽力而为
       }
     })();
+    // EdgeOne keeps the event alive for waitUntil tasks — the writeback must not be
+    // cut off when the response returns before it finishes. / 响应先于回写完成返回时，
+    // 依赖 waitUntil 让运行时保活这次写入。
+    if (context && typeof context.waitUntil === 'function') {
+      context.waitUntil(writeback);
+    }
   }
   markRejected();
 }

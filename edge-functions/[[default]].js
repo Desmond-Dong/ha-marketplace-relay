@@ -291,7 +291,7 @@ export async function onRequest(context) {
   // 共享 token 被拒（额度尽/被吊销）：清缓存，下个请求换新 token。传入状态码让池层精准
   // 处理那条记录（401 停用 / 403 强制重新验活），避免 10 分钟保鲜期内反复拿到同一枚死 token
   if (isApi && (upstream.status === 401 || upstream.status === 403)) {
-    invalidateGithubToken(upstream.status);
+    invalidateGithubToken(upstream.status, context);
   }
 
   const resHeaders = new Headers();

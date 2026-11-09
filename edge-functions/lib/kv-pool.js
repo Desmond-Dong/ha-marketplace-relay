@@ -39,9 +39,37 @@ export function nowStr() {
 }
 
 // Numeric pool id encoded in the key / 键名中的数字池 id
+// Legacy keys were sequential decimals (pool_1); current keys are per-login hashes
+// in base36 — the first 10 chars convert back to a stable display id. Both parse.
+// 旧键型是十进制顺序号（pool_1）；现键型是按 login 的 base36 哈希——取前 10 位转回
+// 稳定的展示用 id。两种都能解析。
 export function poolIdOf(key) {
-  const n = Number(key.slice(POOL_PREFIX.length));
-  return Number.isFinite(n) && n >= 1 ? n : 0;
+  const suffix = key.slice(POOL_PREFIX.length);
+  if (/^[0-9]+$/.test(suffix)) {
+    const n = Number(suffix);
+    return Number.isFinite(n) && n >= 1 ? n : 0;
+  }
+  const n = parseInt(suffix.slice(0, 10), 36);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// Deterministic 64-bit-ish key suffix for a login (two independent FNV-1a rounds,
+// Math.imul keeps the multiplies in int32). Same login → same key forever: per-login
+// dedupe holds by construction, not by scan-and-compare, so concurrent shares on
+// different edge nodes can never overwrite each other.
+// login 的确定性 64 位键后缀（两轮独立 FNV-1a，Math.imul 保证 int32 乘法）。同一
+// login 永远映射同一个键：按 login 去重由构造保证而非扫描比对，不同边缘节点上的
+// 并发分享绝不可能互相覆盖。
+function loginKey(login, attempt) {
+  const s = attempt ? `${login}#${attempt}` : String(login);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2166136261) >>> 0;
+  }
+  return h1.toString(36) + h2.toString(36);
 }
 
 // Load every pool record. The pool is small by design (human-shared tokens),
@@ -73,7 +101,11 @@ export async function loadPool(kvb) {
         }
       });
     }
-    cursor = page && !page.complete ? page.cursor : undefined;
+    // cursor is the first key of the next page per the docs, null when complete;
+    // requiring a truthy cursor guards against a platform quirk looping forever.
+    // cursor 按文档是下一页第一个键、遍历完成时为 null；要求非空才续翻，防止平台
+    // 行为异常时死循环。
+    cursor = page && !page.complete && page.cursor ? page.cursor : undefined;
   } while (cursor);
   return entries;
 }
@@ -134,47 +166,48 @@ export async function pickTokenRecord(kvb) {
   return { key: best.key, id: best.id, rec: best.rec };
 }
 
-// Insert a shared token into the pool, deduped by login: a re-share updates the
-// existing record in place (new token, revive if disabled, keep created_at and
-// use_count). Returns { ok, id, reused } — ok:false means KV write failed.
-// 按登录名去重入池：重复分享原地更新记录（换新 token、复活停用账号、保留
-// created_at 与 use_count）。返回 { ok, id, reused }——ok:false 表示 KV 写入失败。
+// Insert (or update) the caller's record. The key is derived deterministically from
+// the login, so this needs no scan and no id allocation: same login → same key
+// (idempotent re-share that keeps created_at/use_count and revives a pruned record),
+// different logins → different keys (concurrent shares on different nodes can never
+// last-write-win over each other). A 64-bit hash collision with a DIFFERENT login is
+// ~impossible; if it ever happened, the deterministic attempt suffix escapes it.
+// 入库/更新。键由 login 确定性派生，无需扫描、无需分配 id：同一 login → 同一键
+// （幂等重分享，保留 created_at/use_count，复活已停用记录）；不同 login → 不同键
+// （不同节点上的并发分享绝无后写覆盖前写）。64 位哈希与其他 login 撞键概率约等于零；
+// 万一发生，确定性的 attempt 后缀可以逃逸。
 export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
-  const entries = await loadPool(kvb);
   const now = nowStr();
-  const dup = entries.find((e) => e.rec.login && e.rec.login === login);
-  if (dup) {
-    dup.rec.token = token;
-    if (avatar_url) dup.rec.avatar_url = avatar_url;
-    dup.rec.disabled = false;
-    dup.rec.remaining = 0;
-    dup.rec.checked_at = 0; // force revalidation on next pick / 下次选取强制验活
-    dup.rec.updated_at = now;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const key = POOL_PREFIX + loginKey(login, attempt);
+    let prev = null;
     try {
-      await kvb.put(dup.key, JSON.stringify(dup.rec));
-      return { ok: true, id: dup.id, reused: true };
+      prev = await kvb.get(key, 'json');
     } catch (e) {
-      return { ok: false };
+      prev = null; // unreadable existing value → treat as absent, overwrite / 旧值读不出 → 视为不存在，覆盖
+    }
+    if (prev && typeof prev === 'object' && prev.login && prev.login !== login) {
+      continue; // hash collision with a different login → escape via attempt suffix / 与其他 login 撞键 → 换后缀逃逸
+    }
+    const rec = {
+      token,
+      login: login || '',
+      avatar_url: avatar_url || (prev && prev.avatar_url) || '',
+      created_at: (prev && prev.created_at) || now,
+      updated_at: now,
+      use_count: (prev && prev.use_count) || 0,
+      remaining: 0,
+      checked_at: 0, // force revalidation on next pick / 下次选取强制验活
+      // prev.disabled deliberately NOT carried: a re-share revives / 刻意不带 disabled：重分享即复活
+    };
+    try {
+      await kvb.put(key, JSON.stringify(rec));
+      return { ok: true, id: poolIdOf(key), reused: !!prev };
+    } catch (e) {
+      return { ok: false }; // KV write failed (quota/runtime) — surfaced to the caller / KV 写失败（配额/运行时）——上抛给调用方
     }
   }
-  let next = 1;
-  for (const e of entries) if (e.id >= next) next = e.id + 1;
-  const rec = {
-    token,
-    login: login || '',
-    avatar_url: avatar_url || '',
-    created_at: now,
-    updated_at: now,
-    use_count: 0,
-    remaining: 0,
-    checked_at: 0,
-  };
-  try {
-    await kvb.put(`${POOL_PREFIX}${next}`, JSON.stringify(rec));
-    return { ok: true, id: next, reused: false };
-  } catch (e) {
-    return { ok: false };
-  }
+  return { ok: false };
 }
 
 // tokenhub-shaped public record / tokenhub 形状的对外记录
