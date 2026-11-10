@@ -17,7 +17,7 @@
 // token 明文绝不出边缘节点，代理在进程内直接取用（lib/github-token.js →
 // pickTokenRecord），因此不存在可泄露 token 的 HTTP 接口。
 
-import { poolKv, loadPool } from './kv-pool.js';
+import { poolKv, loadPool, revalidateQuota, QUOTA_TTL_MS } from './kv-pool.js';
 
 const noStoreHeaders = {
   'content-type': 'application/json; charset=utf-8',
@@ -49,13 +49,55 @@ export async function getPoolStats(env) {
     return json(200, { count: 0, contributors: [], storage: { records: 0, bytes: 0, quota_bytes: null } });
   }
   try {
-    const entries = await loadPool(kvb);
+    let entries = await loadPool(kvb);
+    const now = Date.now();
 
-    // Last-known values only: no proactive revalidation here. The proxy refreshes a
-    // record's remaining quota whenever it actually picks that token (and on upstream
-    // 401/403), so an idle service makes no API calls just to fill this table.
-    // 只读最后已知值：这里不主动验活。代理每次真正取用某 token（以及上游 401/403）
-    // 时才会刷新剩余额度，服务空闲时不会为了填这张表而发起 API 调用。
+    // Bounded proactive revalidation: a fresh share carries remaining:0 / checked_at:0
+    // and would otherwise stay blank until the proxy happens to pick that exact token.
+    // GitHub's /rate_limit is NOT counted against the core quota, so filling this
+    // table costs the pool nothing. Bound the work: at most MAX_REVALIDATE probes per
+    // call, and each record is probed at most once per freshness window (persisted to
+    // KV), so hammering this endpoint cannot hammer GitHub.
+    // 受限主动验活：新分享的记录带着 remaining:0 / checked_at:0，若只等代理取用才刷新，
+    // 「剩余次数」会一直空白。GitHub /rate_limit 不计入核心配额，填这张表零成本。
+    // 限制工作量：每次调用最多验 MAX_REVALIDATE 条，每条在每个保鲜窗口内最多探一次
+    // （结果回写 KV），狂刷此端点也不会狂打 GitHub。
+    const MAX_REVALIDATE = 10;
+    const stale = entries.filter((e) => {
+      const r = e.rec;
+      return r && r.token && !r.disabled && !(r.checked_at && now - r.checked_at < QUOTA_TTL_MS);
+    });
+    if (stale.length) {
+      await Promise.all(stale.slice(0, MAX_REVALIDATE).map(async (e) => {
+        const v = await revalidateQuota(e.rec);
+        if (v.state === 'unreachable') {
+          // Unreachable is not proof of a dead token: keep the record untouched so the
+          // next probe (or a proxy request) decides.
+          // 不可达不等于失效：保持原状，交给下次探测或代理请求判定。
+          return;
+        }
+        if (v.state === 'dead') {
+          // 401/403: revoked — disable here too, so the table reflects reality even
+          // when no proxy traffic is flowing.
+          // 401/403：已吊销——这里也停用，让表格在没有代理流量时同样反映真实状态。
+          e.rec.disabled = true;
+          e.rec.updated_at = nowStr();
+          await kvb.put(e.key, JSON.stringify(e.rec)).catch(() => {});
+          return;
+        }
+        // ok or exhausted: both carry a real remaining number (0 = used up, recovers
+        // at reset). / ok 或 exhausted：都带真实的 remaining 数值（0 = 已用尽，重置后恢复）。
+        e.rec.remaining = v.remaining;
+        e.rec.checked_at = Date.now();
+        e.rec.reset_at = v.resetAt || 0;
+        e.rec.updated_at = nowStr();
+        await kvb.put(e.key, JSON.stringify(e.rec)).catch(() => {});
+      }));
+    }
+    // Re-read after writes so this response already shows the fresh values.
+    // 写完重读一遍，让本次响应直接展示新值。
+    entries = await loadPool(kvb);
+
     const contributors = entries
       .map((e) => {
         // A record inserted but never used yet carries remaining:0 / checked_at:0 as a
@@ -63,6 +105,8 @@ export async function getPoolStats(env) {
         // 刚入库、尚未被取用的记录带着 remaining:0 / checked_at:0 的「强制验活」标记，
         // 那不是已知值，保持空白。
         const known = typeof e.rec.remaining === 'number' && e.rec.checked_at > 0;
+        // Exhausted shows a truthful 0 (recovers at reset); never-known stays blank.
+        // 已耗尽如实显示 0（重置后恢复）；从未验活的保持空白。
         return {
           login: e.rec.login || 'anonymous',
           use_count: e.rec.use_count || 0,
