@@ -281,6 +281,14 @@ export async function pickTokenRecord(kvb, excludeTokens) {
     return null;
   }
   best.rec.use_count = (best.rec.use_count || 0) + 1;
+  // Each proxied request consumes exactly one unit of the picked token's core quota:
+  // decrement the locally known remaining so the table (uses vs remaining) stays
+  // consistent between GitHub's own /rate_limit snapshots. / 每次代理请求恰好消耗
+  // 中选 token 的 1 个核心配额：同步把本地已知的 remaining 减一，让「使用次数」与
+  // 「剩余次数」在两次 GitHub 验活之间保持一致。
+  if (typeof best.rec.remaining === 'number' && best.rec.remaining > 0) {
+    best.rec.remaining -= 1;
+  }
   best.rec.updated_at = nowStr();
   await kvb.put(best.key, JSON.stringify(best.rec));
   return { key: best.key, id: best.id, rec: best.rec };
