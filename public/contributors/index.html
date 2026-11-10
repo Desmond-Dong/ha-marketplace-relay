@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/assets/site.css">
 </head>
 <body>
+<div class="page">
 <div class="card inner">
   <a class="back" href="/">← 返回首页<span class="step-en">Back to Home</span></a>
   <div class="page-head">
@@ -33,6 +34,12 @@
   </table>
   <p class="desc join">想加入？前往 <a href="/share/">共享 Token</a> 页面，一键授权即可。</p>
   <p class="desc en">Want to join? Visit <a href="/share/">Share Token</a> to contribute in one click.</p>
+</div>
+
+<footer class="beian">
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2025160066号-1</a>
+    <a href="https://www.beian.gov.cn/portal/registerSystemInfo?recordcode=33010902004199" target="_blank" rel="noopener noreferrer">浙公网安备33010902004199号</a>
+  </footer>
 </div>
 
 <script>
@@ -67,5 +74,6 @@ fetch('/api/token/stats')
   .then((d) => render(Array.isArray(d && d.contributors) ? d.contributors : []))
   .catch(() => { poolBody.innerHTML = PLACEHOLDER; });
 </script>
+</div>
 </body>
 </html>
