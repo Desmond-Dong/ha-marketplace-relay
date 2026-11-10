@@ -96,7 +96,7 @@ p.join { margin-top: 18px; }
 /* ---- home CTA hint / 首页共享引导 ---- */
 .hero-note { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 6px 0 0; max-width: 36em; margin-left: auto; margin-right: auto; }
 .hero-note .en { margin-left: 6px; }
-.why-share { font-size: 13px; line-height: 1.9; color: #57606a; margin: 16px auto 0; max-width: 30em; text-align: center; }
-.why-share-en { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 4px auto 0; max-width: 30em; text-align: center; }
-.cta-hint { font-size: 13px; line-height: 1.8; color: #57606a; margin: 14px 0 0; max-width: 30em; margin-left: auto; margin-right: auto; text-align: center; }
-p.cta-hint-en { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 4px 0 0; max-width: 30em; margin-left: auto; margin-right: auto; text-align: center; }
+.why-share { font-size: 13px; line-height: 1.9; color: #57606a; margin: 16px auto 0; max-width: 34em; text-align: center; }
+.why-share-en { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 4px auto 0; max-width: 36em; text-align: center; }
+.cta-hint { font-size: 13px; line-height: 1.8; color: #57606a; margin: 14px 0 0; max-width: 34em; margin-left: auto; margin-right: auto; text-align: center; }
+p.cta-hint-en { font-size: 12.5px; line-height: 1.7; color: #8b949e; margin: 4px 0 0; max-width: 36em; margin-left: auto; margin-right: auto; text-align: center; }
