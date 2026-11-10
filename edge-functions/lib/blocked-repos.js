@@ -1,28 +1,33 @@
-// KV-driven repo blocklist / KV 驱动的仓库排除名单
+// KV-driven repo lists: blocklist AND allowlist / KV 驱动的仓库名单：排除 + 白名单
 //
-// The list lives in the same KV namespace as the token pool, key `blocked_repos`,
-// stored as a JSON array of patterns. Patterns are matched case-insensitively:
-//   "owner/repo"  — block that whole repository (API, releases, source archives, raw)
-//   "owner/*"     — block every repository of that owner
-// Editing the key in the EdgeOne console takes effect within BLOCKLIST_TTL_MS (60 s) —
-// no redeploy needed. A missing, empty or malformed key means "nothing blocked".
-// The read is cached in-isolate for 60 s so per-request cost stays one in-memory map
-// lookup; only one isolate per 60 s actually hits KV.
+// Two keys in the same KV namespace as the token pool, each a JSON array of patterns,
+// matched case-insensitively:
+//   blocked_repos — repos to always reject: "owner/repo" or "owner/*"
+//   allow_repos   — when non-empty, ONLY these repos are served (strict allowlist mode);
+//                   empty / missing / malformed = allow everything (default)
+// Both keys are console-editable and take effect within LIST_TTL_MS (60 s) — no redeploy.
+// Cache is per-isolate with a 60 s TTL; per-request cost is one in-memory array scan,
+// and only one isolate per 60 s actually hits KV. Any KV error degrades safely:
+// blocklist -> nothing blocked, allowlist -> everything allowed.
 //
-// 名单与 token 池同在 KV 命名空间 `marketplace`，键 `blocked_repos`，JSON 数组。
-// 匹配不区分大小写：
-//   "owner/repo" — 整仓排除（API、release、源码包、raw 全挡）
-//   "owner/*"    — 该 owner 名下全部仓库排除
-// 在 EdgeOne 控制台编辑该键，最多 BLOCKLIST_TTL_MS（60 秒）后全网生效——无需重新部署。
-// 键缺失 / 为空 / 格式非法 = 不排除任何仓库。读取带 60 秒 isolate 内缓存，
-// 每个请求的代价只是一次内存查询；每 60 秒只有一个请求真正访问 KV。
+// 两个键与 token 池同在 KV 命名空间 `marketplace`，JSON 数组、不区分大小写：
+//   blocked_repos — 恒拒绝名单："owner/repo" 或 "owner/*"
+//   allow_repos   — 非空时进入严格白名单模式（只放行名单内仓库）；
+//                   空 / 缺失 / 格式非法 = 全放行（默认）
+// 两键均在控制台编辑，最多 LIST_TTL_MS（60 秒）生效，无需重新部署。
+// 读取带 isolate 内 60 秒缓存：每请求只是一次内存比对，每 60 秒只有一个请求真正
+// 访问 KV。KV 异常一律安全降级：黑名单按「无排除」、白名单按「全放行」。
 
 import { poolKv } from './kv-pool.js';
 
 export const BLOCKLIST_KEY = 'blocked_repos';
-const BLOCKLIST_TTL_MS = 60 * 1000;
+export const ALLOWLIST_KEY = 'allow_repos';
+const LIST_TTL_MS = 60 * 1000;
 
-let cache = { list: null, fetchedAt: 0 };
+const cache = {
+  blocked: { list: null, fetchedAt: 0 },
+  allowed: { list: null, fetchedAt: 0 },
+};
 
 function parseList(raw) {
   if (!raw) return [];
@@ -37,22 +42,31 @@ function parseList(raw) {
   }
 }
 
-// Load the list (cached). Never throws — any KV problem means "no blocking".
-// 加载名单（带缓存）。任何异常都按「无排除」处理，绝不影响正常请求。
-export async function getBlockedRepos() {
+// Load one list (cached). Never throws — KV problems degrade per key semantics.
+// 加载单个名单（带缓存）。任何异常都按该键的语义安全降级。
+async function getList(key, slot) {
   const now = Date.now();
-  if (cache.list && now - cache.fetchedAt < BLOCKLIST_TTL_MS) return cache.list;
+  if (slot.list && now - slot.fetchedAt < LIST_TTL_MS) return slot.list;
   const kvb = poolKv();
   if (!kvb) return [];
   let list = [];
   try {
-    const raw = await kvb.get(BLOCKLIST_KEY);
+    const raw = await kvb.get(key);
     list = parseList(raw);
   } catch (e) {
     list = [];
   }
-  cache = { list, fetchedAt: now };
+  slot.list = list;
+  slot.fetchedAt = now;
   return list;
+}
+
+export function getBlockedRepos() {
+  return getList(BLOCKLIST_KEY, cache.blocked);
+}
+
+export function getAllowedRepos() {
+  return getList(ALLOWLIST_KEY, cache.allowed);
 }
 
 // Match "owner/repo" against the list; "owner/*" blocks the whole owner.
@@ -86,7 +100,19 @@ export function ownerRepoOf(hostname, pathname) {
   return null;
 }
 
+// Combined gate: blocked wins over allowed; empty allowlist = allow all.
+// 组合判定：先黑名单后白名单；白名单为空 = 全放行。
+// Returns { blocked, allowed } — caller answers 403 when blocked===true or allowed===false.
+// 返回 { blocked, allowed }——blocked===true 或 allowed===false 时调用方回 403。
+export async function checkRepo(owner, repo) {
+  const [blocked, allowed] = await Promise.all([getBlockedRepos(), getAllowedRepos()]);
+  const isBlocked = isRepoBlocked(blocked, owner, repo);
+  const isAllowed = !allowed || allowed.length === 0 || isRepoBlocked(allowed, owner, repo);
+  return { blocked: isBlocked, allowed: isAllowed };
+}
+
 // Test helper used by lib self-checks (also keeps the module shape explicit).
 export function resetBlocklistCacheForTests() {
-  cache = { list: null, fetchedAt: 0 };
+  cache.blocked = { list: null, fetchedAt: 0 };
+  cache.allowed = { list: null, fetchedAt: 0 };
 }
