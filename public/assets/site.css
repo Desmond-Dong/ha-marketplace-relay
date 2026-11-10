@@ -54,8 +54,11 @@ nav a { display: inline-block; padding: 8px 18px; border: 1px solid #d0d7de; bor
 nav a:hover { background: #eaeef2; }
 nav a .btn-en { font-size: 11.5px; color: #8b949e; opacity: 1; margin-top: 3px; }
 
+/* ---- page column: card + filing footer stacked / 页面纵向容器：卡片 + 备案 ---- */
+.page { display: flex; flex-direction: column; align-items: center; width: 100%; }
+
 /* ---- ICP / public-security filing footer / 备案号 ---- */
-.beian { margin-top: 20px; padding-top: 14px; border-top: 1px solid #eaeef2; display: flex; gap: 8px 18px; justify-content: center; flex-wrap: wrap; font-size: 12px; }
+.beian { margin-top: 20px; padding-top: 14px; border-top: 1px solid #eaeef2; display: flex; gap: 8px 18px; justify-content: center; flex-wrap: wrap; font-size: 12px; width: 100%; max-width: 560px; }
 .beian a { color: #8b949e; text-decoration: none; }
 .beian a:hover { color: #57606a; text-decoration: underline; }
 

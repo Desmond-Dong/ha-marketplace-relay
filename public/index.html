@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/assets/site.css">
 </head>
 <body class="centered hero-bg">
+<div class="page">
 <div class="card narrow hero-card">
   <img class="logo" src="https://www.hasscn.top/home-assistant-wordmark-with-margins-color-on-light.png" alt="Home Assistant">
   <h1 class="hero-title">Home Assistant Marketplace 服务<span class="en">Home Assistant Marketplace service</span></h1>
@@ -31,7 +32,7 @@
     <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">浙ICP备2025160066号-1</a>
     <a href="https://www.beian.gov.cn/portal/registerSystemInfo?recordcode=33010902004199" target="_blank" rel="noopener noreferrer">浙公网安备33010902004199号</a>
   </footer>
-</body>
+</div>
 
 <script>
 // 共享池用量：拉取 /api/token/stats 的脱敏统计，展示记录数与 KV 存储占用。
@@ -61,5 +62,6 @@
     .catch(() => { /* 统计不可用时保持隐藏 / keep hidden when stats are unavailable */ });
 })();
 </script>
+</div>
 </body>
 </html>
