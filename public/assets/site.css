@@ -28,6 +28,22 @@ a { color: #0969da; text-decoration: none; }
 .step-en { font-size: 12px; color: #8b949e; line-height: 1.6; margin-top: 2px; }
 .btn-en { display: block; font-size: 12px; font-weight: 400; opacity: .85; margin-top: 2px; }
 
+/* ---- inner pages / 内页：标题与图标同行 + 紧凑排版 ---- */
+.card.inner { padding: 28px 36px 32px; }
+.page-head { display: flex; align-items: center; gap: 12px; margin: 0 0 2px; }
+.page-head .icon { font-size: 30px; line-height: 1; }
+.page-head h1 { margin: 0; font-size: 19px; }
+.card.inner .back { margin-bottom: 8px; }
+.card.inner p { margin: 8px 0 2px; }
+.card.inner p.en, .card.inner p.desc.en { margin: 0 0 6px; }
+.card.inner h1 .en { font-size: 13px; margin-top: 3px; }
+.card.inner .privacy { margin: 14px 0; padding: 14px 16px; }
+.card.inner .privacy li { margin: 7px 0; line-height: 1.7; }
+.card.inner button { margin-top: 6px; }
+.card.inner .step { margin: 10px 0; padding: 12px 14px; }
+.card.inner table { margin-top: 8px; }
+.card.inner p.join { margin-top: 12px; }
+
 /* ---- back link / 返回链接 ---- */
 .back { display: inline-block; margin-bottom: 16px; color: #0969da; text-decoration: none; font-size: 14px; }
 .back .step-en { display: block; font-size: 12px; color: #8b949e; margin-top: 2px; }
