@@ -224,7 +224,7 @@ export async function revalidateQuota(rec) {
 export async function pickTokenRecord(kvb, excludeTokens) {
   const entries = await loadPool(kvb);
   let best = null;
-  let bestRemaining = -1;
+  let bestScore = -Infinity;
   for (const e of entries) {
     const raw = e.rec;
     if (!raw || !raw.token || raw.disabled) continue;
@@ -264,13 +264,31 @@ export async function pickTokenRecord(kvb, excludeTokens) {
       if (v.state === 'exhausted') continue;
       remaining = v.remaining;
     }
-    if (remaining > bestRemaining) { best = e; bestRemaining = remaining; }
+    // Weighted rotation: prefer the largest remaining quota, but jitter the score so
+    // near-equal tokens take turns instead of one token being hammered until empty
+    // (strict max kept concentrating every request on a single contributor). Jitter
+    // scale ±250 is tiny against a 5000 quota, so the pool's total headroom is still
+    // spent in the same order (largest first), just spread across its members.
+    // 加权轮换：仍偏向剩余额度最高的 token，但给评分加抖动，让额度相近的 token
+    // 轮流出勤，而不是把一条打到耗尽才换下一条（严格取最大会把请求集中在单个
+    // 贡献者身上）。±250 相对 5000 的额度微不足道，池子的总可用额度依旧按
+    // 「大的先用」的顺序消耗，只是均匀摊到每个成员。
+    const score = remaining + (Math.random() * 500 - 250);
+    if (score > bestScore) { best = e; bestScore = score; }
   }
   if (!best) {
     console.warn('[kv] pick: no usable token in pool');
     return null;
   }
   best.rec.use_count = (best.rec.use_count || 0) + 1;
+  // Each proxied request consumes exactly one unit of the picked token's core quota:
+  // decrement the locally known remaining so the table (uses vs remaining) stays
+  // consistent between GitHub's own /rate_limit snapshots. / 每次代理请求恰好消耗
+  // 中选 token 的 1 个核心配额：同步把本地已知的 remaining 减一，让「使用次数」与
+  // 「剩余次数」在两次 GitHub 验活之间保持一致。
+  if (typeof best.rec.remaining === 'number' && best.rec.remaining > 0) {
+    best.rec.remaining -= 1;
+  }
   best.rec.updated_at = nowStr();
   await kvb.put(best.key, JSON.stringify(best.rec));
   return { key: best.key, id: best.id, rec: best.rec };

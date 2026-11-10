@@ -7,20 +7,22 @@
 <link rel="stylesheet" href="/assets/site.css">
 </head>
 <body>
-<div class="card">
+<div class="card inner">
   <a class="back" href="/">← 返回首页<span class="step-en">Back to Home</span></a>
-  <div class="icon">💖</div>
-  <h1>Token 贡献者<span class="en">Token Contributors</span></h1>
+  <div class="page-head">
+    <div class="icon">💖</div>
+    <h1>Token 贡献者<span class="en">Token Contributors</span></h1>
+  </div>
   <p class="desc">感谢所有向共享池贡献 GitHub Token 的朋友。</p>
   <p class="desc en">Thanks to everyone sharing a GitHub token with the pool.</p>
-  <p class="desc">此页面展示脱敏统计（账号名 / 使用次数 / 剩余额度），Token 明文永不展示。</p>
-  <p class="desc en">Only masked stats are shown (login / use count / remaining quota). Raw tokens are never displayed.</p>
+  <p class="desc">此页面展示脱敏统计（账号名 / 累计调用 / 本小时剩余额度），Token 明文永不展示。</p>
+  <p class="desc en">Only masked stats are shown (login / total calls / remaining quota this hour). Raw tokens are never displayed.</p>
   <table>
     <thead>
       <tr>
         <th>账号<span class="en">Login</span></th>
-        <th>使用次数<span class="en">Uses</span></th>
-        <th>剩余额度<span class="en">Remaining</span></th>
+        <th>累计调用<span class="en">Total Calls</span></th>
+        <th>本小时剩余<span class="en">Left This Hour</span></th>
         <th>状态<span class="en">Status</span></th>
       </tr>
     </thead>
