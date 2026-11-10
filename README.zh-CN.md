@@ -28,6 +28,7 @@ Home Assistant Marketplace
     ├─ User-Agent 含 "HomeAssistantMarketplace" 或 "HomeAssistant"   → 否则 403
     ├─ 每 IP 600 次 / 小时（滑动窗口）                              → 超出 429
     ├─ 目标域名必须在 GitHub 官方白名单内                           → 否则 403
+    ├─ 仓库排除名单（KV 键 `blocked_repos`，控制台可编辑）          → 命中 403
     └─ 文件类型黑名单（镜像 / 安装包 / 视频 / 虚拟机磁盘）          → 命中 403
         ▼
 [3] URL 归一化与重映射
@@ -181,6 +182,34 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 - 不放行 `gist.github.com` / `gist.githubusercontent.com`——HACS 与 Marketplace 不从 gist 取内容，白名单每多一个主机就多一块可被借道访问的面
 - 每 IP 限流：600 次 / 小时
 
+### 仓库排除名单 / Repo blocklist
+
+命中排除名单的仓库请求在任何上游调用之前即被 403 拒绝——覆盖该仓库的 release 下载、
+源码包、raw 文件、API 调用与资产 CDN 重定向。名单存于 KV，直接在控制台编辑，
+无需重新部署：
+
+- **键**：`marketplace` KV 命名空间里的 `blocked_repos`
+- **值**：JSON 数组，模式不区分大小写
+
+```json
+[
+  "owner/bad-repo",
+  "spam-user/*"
+]
+```
+
+- `owner/repo`——排除该仓库的全部请求形态。
+- `owner/*`——排除该 owner 名下所有仓库。
+
+**语义**
+
+- 编辑后 **60 秒**内生效（isolate 内缓存；每 isolate 每 60 秒最多读一次 KV，
+  单请求成本只是一次内存数组比对）。
+- 键缺失、为空或格式非法 = **不排除任何仓库**——写坏名单绝不会拖垮服务；
+  KV 读取异常同样安全降级。
+- 检查发生在缓存查询与任何上游跳之前：被排除仓库不产生任何上游流量。
+- 想恢复某仓库，删除对应条目（或整个键）即可，同样 60 秒内生效。
+
 ## 部署
 
 1. 在 EdgeOne Makers 连接本仓库，加速区域选「全球可用区（含中国大陆）」
@@ -211,6 +240,7 @@ release 资产缓存使用 EdgeOne Pages Blob：store 名 `github-cache`，与 K
 - [x] release 资产 Blob 缓存：SHA-256 键的 `meta`/`body` 双键、二进制精确读写、响应前写入、只缓存 ≤ 4MB 的完整请求、按文件数自动淘汰最老项，纯加速层不影响正确性
 - [x] 共享 token 加权轮换——额度相近的 token 轮流出勤，不再由单个贡献者吸收全部流量；每次代理请求同步扣减该 token 本地已知的剩余额度
 - [x] Device Flow 入库保证——写入重试 + 回读校验，失败时保留会话并重新入库，绝不把还能落盘的授权报成失败
+- [x] 控制台可编辑的仓库排除名单——KV 键 `blocked_repos`，支持 `owner/repo` 与 `owner/*`，在上游调用前 403，60 秒缓存，键缺失/损坏安全降级
 - [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复（暂缓）
 
 ## README

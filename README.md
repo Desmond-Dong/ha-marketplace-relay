@@ -28,6 +28,7 @@ Home Assistant Marketplace
     ├─ User-Agent contains "HomeAssistantMarketplace" or "HomeAssistant" → 403 otherwise
     ├─ 600 requests / IP / hour (sliding window)                         → 429 beyond
     ├─ Target host must be in the GitHub allowlist                       → 403 otherwise
+    ├─ Repo blocklist (KV key `blocked_repos`, console-editable)         → 403 on match
     └─ File-type blocklist (disk images / installers / video / VM disks) → 403 on match
         ▼
 [3] URL normalization & remapping
@@ -206,6 +207,36 @@ hand, no size accounting to drift.
 - `gist.github.com` / `gist.githubusercontent.com` are NOT allowed — HACS and the Marketplace never fetch gist content, and every extra host is one more surface reachable through the service
 - Per-IP rate limit: 600 requests/hour
 
+### Repo blocklist / 仓库排除名单
+
+Requests targeting a blocked repository are rejected with 403 before any upstream call —
+covering release downloads, source archives, raw files, API calls and asset-CDN redirects
+for that repo. The list lives in KV, so you edit it in the console, no redeploy:
+
+- **Key**: `blocked_repos` in the `marketplace` KV namespace
+- **Value**: a JSON array of patterns (case-insensitive)
+
+```json
+[
+  "owner/bad-repo",
+  "spam-user/*"
+]
+```
+
+- `owner/repo` blocks that whole repository (every URL form).
+- `owner/*` blocks every repository under that owner.
+
+**Semantics**
+
+- Edits take effect within **60 seconds** (per-isolate cache; at most one KV read per 60 s
+  per isolate, so the per-request cost is one in-memory array scan).
+- A missing, empty or malformed key means **nothing is blocked** — a broken list can never
+  take the service down. Any KV read error degrades the same way.
+- The check runs before the cache lookup and before any upstream hop: a blocked repo
+  generates no upstream traffic at all.
+- To stop blocking a repo, remove the entry (or the whole key) — again effective within
+  60 seconds.
+
 ## Deployment
 
 1. Connect this repository to EdgeOne Makers, acceleration region: "Global (including Chinese mainland)"
@@ -238,6 +269,7 @@ site-wide 545 rather than a cache miss.
 - [x] Blob cache for release assets: SHA-256 keyed `meta`/`body` pair, binary-exact reads, write-before-respond, full requests ≤ 4 MB only, oldest entries auto-evicted by file count, pure acceleration with no effect on correctness
 - [x] Weighted rotation across pooled tokens — near-equal tokens take turns instead of one contributor absorbing all traffic; every proxied request decrements that token's locally known remaining quota
 - [x] Guaranteed token persistence in the Device Flow — retried writes with read-back verification, session kept and re-inserted on failure, so an authorization is never reported as failed when it could still land
+- [x] Console-editable repo blocklist — KV key `blocked_repos`, `owner/repo` or `owner/*` patterns, 403 before any upstream call, 60 s cache, safe-degrade on missing/broken key
 - [ ] Admin endpoints `export` / `import` (AdminKey auth) for KV backup & restore (deferred)
 
 ## README

@@ -18,6 +18,7 @@ import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
 import { getPoolStats } from './lib/pool-api.js';
 import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
+import { checkRepo, ownerRepoOf } from './lib/blocked-repos.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -256,6 +257,22 @@ async function handleRequestInner(context) {
   }
   if (!ALLOWED_HOSTS.has(target.hostname)) {
     return jsonError(403, 'not allowed');
+  }
+
+  // KV-driven repo lists (console-editable, 60 s cache) / KV 仓库名单（控制台可编辑，60 秒缓存）
+  // blocklist blocked_repos wins; non-empty allowlist allow_repos switches to strict mode.
+  // Checked on the OUTER url so every host form (raw / github / api / codeload / asset
+  // CDNs) is covered before remapping; a rejected repo costs one 403, no upstream call.
+  // 黑名单 blocked_repos 恒拒绝；非空白名单 allow_repos 进入严格模式只放行名单内仓库。
+  // 在外层 URL 上检查，覆盖所有域名形态（raw / github / api / codeload / 资产 CDN），
+  // 重映射之前就拦截；被拒仓库直接 403，不产生任何上游调用。
+  const gateOwnerRepo = ownerRepoOf(target.hostname, target.pathname);
+  if (gateOwnerRepo) {
+    const gate = await checkRepo(gateOwnerRepo.owner, gateOwnerRepo.repo);
+    if (gate.blocked || !gate.allowed) {
+      reqLog(id, gate.blocked ? 'blocked repo' : 'repo not allowlisted', `${gateOwnerRepo.owner}/${gateOwnerRepo.repo}`);
+      return jsonError(403, 'not allowed');
+    }
   }
 
   // Blocked file types / 黑名单文件类型拦截
