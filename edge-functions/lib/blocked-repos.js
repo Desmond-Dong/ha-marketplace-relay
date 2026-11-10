@@ -1,8 +1,12 @@
 // KV-driven repo lists: blocklist AND allowlist / KV 驱动的仓库名单：排除 + 白名单
 //
 // Two keys in the same KV namespace as the token pool, each a JSON array of patterns,
-// matched case-insensitively:
-//   blocked_repos — repos to always reject: "owner/repo" or "owner/*"
+// matched case-insensitively. Pattern forms:
+//   "owner/repo"  — exact repo
+//   "owner/*"     — every repo of that owner
+//   "*vpn*"       — substring: matches anywhere in "owner/repo" (owner OR repo part)
+//   "nvidia*" / "*vpn" — prefix / suffix
+//   blocked_repos — repos to always reject
 //   allow_repos   — when non-empty, ONLY these repos are served (strict allowlist mode);
 //                   empty / missing / malformed = allow everything (default)
 // Both keys are console-editable and take effect within LIST_TTL_MS (60 s) — no redeploy.
@@ -10,8 +14,10 @@
 // and only one isolate per 60 s actually hits KV. Any KV error degrades safely:
 // blocklist -> nothing blocked, allowlist -> everything allowed.
 //
-// 两个键与 token 池同在 KV 命名空间 `marketplace`，JSON 数组、不区分大小写：
-//   blocked_repos — 恒拒绝名单："owner/repo" 或 "owner/*"
+// 两个键与 token 池同在 KV 命名空间 `marketplace`，JSON 数组、不区分大小写。模式形态：
+//   "owner/repo" 精确整仓；"owner/*" 该 owner 全部；"*vpn*" 子串（owner/repo 任意位置命中）；
+//   "nvidia*" 前缀 / "*vpn" 后缀
+//   blocked_repos — 恒拒绝名单
 //   allow_repos   — 非空时进入严格白名单模式（只放行名单内仓库）；
 //                   空 / 缺失 / 格式非法 = 全放行（默认）
 // 两键均在控制台编辑，最多 LIST_TTL_MS（60 秒）生效，无需重新部署。
@@ -36,7 +42,7 @@ function parseList(raw) {
     if (!Array.isArray(arr)) return [];
     return arr
       .map((s) => String(s || '').trim().toLowerCase())
-      .filter((s) => /^[a-z0-9-_.]+\/*(\*)?$/.test(s) || /^[a-z0-9-_.]+\/[a-z0-9-_.]+$/i.test(s));
+      .filter(Boolean);
   } catch (e) {
     return [];
   }
@@ -76,9 +82,27 @@ export function isRepoBlocked(list, owner, repo) {
   const o = String(owner || '').toLowerCase();
   const r = String(repo || '').toLowerCase();
   if (!o) return false;
-  for (const pat of list) {
+  const target = `${o}/${r}`;
+  for (const pat0 of list) {
+    const pat = String(pat0 || '').trim().toLowerCase();
+    if (!pat) continue;
+    // Substring wildcard: *vpn* / *nvidia* — match anywhere in owner/repo.
+    // 子串通配：只要出现在 owner/repo 任意位置即命中。
+    if (pat.includes('*')) {
+      // "owner/*" handled by the generic path below too, but keep it fast here.
+      // Turn each pattern into a regex: * → .* , escape the rest.
+      const rxSrc = pat.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+      let rx;
+      try {
+        rx = new RegExp(`^${rxSrc}$`);
+      } catch (e) {
+        continue; // malformed pattern never breaks the gate / 坏模式绝不影响判定
+      }
+      if (rx.test(target)) return true;
+      continue;
+    }
     if (pat === `${o}/*` || pat === `${o}/`) return true;
-    if (pat === `${o}/${r}`) return true;
+    if (pat === target) return true;
   }
   return false;
 }
