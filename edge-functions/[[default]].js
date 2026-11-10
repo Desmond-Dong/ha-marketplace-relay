@@ -18,6 +18,7 @@ import { getGithubToken, invalidateGithubToken } from './lib/github-token.js';
 import { startDeviceFlow, pollDeviceFlow } from './lib/device-flow.js';
 import { getPoolStats } from './lib/pool-api.js';
 import { findCached, setCached, shouldCache } from './lib/blob-cache.js';
+import { getBlockedRepos, isRepoBlocked, ownerRepoOf } from './lib/blocked-repos.js';
 
 // Upstream hosts allowed through the proxy / 允许代理的上游域名
 // NOTE: raw.githubusercontent.com (Fastly 185.199.x) is unreachable from EdgeOne egress,
@@ -256,6 +257,20 @@ async function handleRequestInner(context) {
   }
   if (!ALLOWED_HOSTS.has(target.hostname)) {
     return jsonError(403, 'not allowed');
+  }
+
+  // KV-driven repo blocklist (console-editable, 60 s cache) / KV 排除名单（控制台可编辑，60 秒缓存）
+  // Checked on the OUTER url so every host form (raw / github / api / codeload / asset
+  // CDNs) is covered before remapping; blocked repos cost one 403, no upstream call.
+  // 在外层 URL 上检查，覆盖所有域名形态（raw / github / api / codeload / 资产 CDN），
+  // 重映射之前就拦截；被排除仓库直接 403，不产生任何上游调用。
+  const blockOwnerRepo = ownerRepoOf(target.hostname, target.pathname);
+  if (blockOwnerRepo) {
+    const blocked = await getBlockedRepos();
+    if (isRepoBlocked(blocked, blockOwnerRepo.owner, blockOwnerRepo.repo)) {
+      reqLog(id, 'blocked repo', `${blockOwnerRepo.owner}/${blockOwnerRepo.repo}`);
+      return jsonError(403, 'not allowed');
+    }
   }
 
   // Blocked file types / 黑名单文件类型拦截
