@@ -206,7 +206,7 @@ All JSON error responses share the shape `{"error":"<code>"}` plus CORS headers;
 bodies are passed through from GitHub byte-for-byte (or served from Blob). All gate
 rejections deliberately share the same body — the service never discloses which check fired.
 
-### Proxy requests (`/https://…`)
+### Service requests (`/https://…`)
 
 | Status | Meaning | Produced by |
 |---|---|---|
@@ -214,7 +214,7 @@ rejections deliberately share the same body — the service never discloses whic
 | 204 | CORS preflight (`OPTIONS`) | service |
 | 206 | Partial content for `Range` (resumable downloads) | passthrough |
 | 403 | `{"error":"not allowed"}` — exactly one of: UA gate failed (no `HomeAssistant` substring), target host outside the 7-host allowlist, repo on `blocked_repos`, repo outside `allow_repos` in strict mode, blocked file type, or GitHub's own permission 403 (passed through) | gate / upstream |
-| 404 | `{"error":"not found"}` — GitHub says the repo / ref / file does not exist (passed through unchanged); or a non-proxy path with no matching static page | upstream / service |
+| 404 | `{"error":"not found"}` — GitHub says the repo / ref / file does not exist (passed through unchanged); or a service path with no matching static page | upstream / service |
 | 429 | `{"error":"too many requests"}` — per-IP limit (600 req/h), or GitHub API quota still exhausted after the pool retry (passed through) | service / upstream |
 | 500 | Diagnostic only — send header `x-diag: 1` to receive the real error message (temporary aid, to be removed) | service |
 | 502 | `{"error":"upstream error"}` — upstream fetch failed, a redirect hop left the allowlist, or an uncaught internal error (every exception is contained here) | service |
@@ -231,7 +231,7 @@ redirect handler and never reach the client as-is).
 | `POST /share/device/poll` | `200 {status: pending \| ok \| expired \| denied}` — `ok` adds `login` / `avatar_url` / `stored`; interim flags: `slow_down`, `storing`, `reused` | `403 not allowed` · `404 not found` (malformed session) · `502 upstream error` / `storage unavailable` · `503 service unavailable` |
 | `GET /api/token/stats` | `200` masked pool stats (no token material) | `502 {"error":"kv error"}` |
 
-Non-proxy paths fall through to the static pages (home / contributors / share); a path with
+Paths outside the `/https://…` prefix fall through to the static pages (home / contributors / share); a path with
 no page returns `404 {"error":"not found"}`.
 
 ## Requirements
