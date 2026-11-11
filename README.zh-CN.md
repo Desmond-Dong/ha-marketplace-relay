@@ -175,6 +175,38 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 | 响应头 | 剥离逐跳头，附加 CORS，其余透传 |
 | 响应体 | 逐字节流式透传；可缓存的 release 资产（≤ 4MB 的完整请求）整体缓冲、写入 Blob 后再回传 |
 
+## 返回码速查
+
+所有 JSON 错误响应统一为 `{"error":"<code>"}` 并带 CORS 头；成功响应逐字节透传自 GitHub
+（或由 Blob 缓存直接回源）。所有门禁拒绝刻意共用同一个响应体——服务不透露具体是哪道门拦的。
+
+### 代理请求（`/https://…`）
+
+| 状态码 | 含义 | 产生方 |
+|---|---|---|
+| 200 | 成功，完整 body。缓存命中同样是 200——`x-cache: HIT` / `MISS` 头区分来源 | 服务 / 上游 |
+| 204 | CORS 预检（`OPTIONS`） | 服务 |
+| 206 | `Range` 断点续传的部分内容 | 透传 |
+| 403 | `{"error":"not allowed"}`——以下之一：UA 门禁未过（UA 不含 `HomeAssistant`）、目标域名不在 7 域名白名单、仓库命中 `blocked_repos`、严格模式下仓库不在 `allow_repos`、文件类型黑名单命中、GitHub 自身的权限 403（原样透传） | 门禁 / 上游 |
+| 404 | `{"error":"not found"}`——GitHub 判定仓库 / 分支 / 文件不存在（原样透传）；或非代理路径且无匹配静态页 | 上游 / 服务 |
+| 429 | `{"error":"too many requests"}`——每 IP 限流（600 次 / 时），或共享池重试后 GitHub 配额仍然耗尽（透传） | 服务 / 上游 |
+| 500 | 仅诊断用——请求带 `x-diag: 1` 头时返回真实错误信息（临时手段，后续移除） | 服务 |
+| 502 | `{"error":"upstream error"}`——上游请求失败、重定向跳出白名单、或未捕获的内部错误（所有异常都收拢到这里） | 服务 |
+| 545 | EdgeOne 的不透明「script error」。正常情况下不该出现——所有 handler 错误都会映射为 502；若见到即为平台级问题（冷启动 / 打包），与客户端无关 | 平台 |
+
+其余上游状态码原样透传（301/302 在内部由重定向处理器消费，客户端不会直接看到）。
+
+### 辅助端点
+
+| 端点 | 成功 | 错误 |
+|---|---|---|
+| `POST /share/device/start` | `200 {user_code, verification_uri, expires_in, interval}` | `403 not allowed`（缺 host 头）· `429 too many requests`（start 限流）· `502 upstream error` · `503 service unavailable`（OAuth 应用未配置） |
+| `POST /share/device/poll` | `200 {status: pending \| ok \| expired \| denied}`——`ok` 附带 `login` / `avatar_url` / `stored`；中间态标记：`slow_down`、`storing`、`reused` | `403 not allowed` · `404 not found`（session 格式非法）· `502 upstream error` / `storage unavailable` · `503 service unavailable` |
+| `GET /api/token/stats` | `200` 脱敏共享池统计（无任何 token 明文） | `502 {"error":"kv error"}` |
+
+非代理路径回落到静态页面（首页 / 贡献者 / 共享 Token）；无匹配页面时返回
+`404 {"error":"not found"}`。
+
 ## 请求要求
 
 - 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace` 或 `HomeAssistant`
@@ -200,6 +232,8 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 
 - `owner/repo`——排除该仓库的全部请求形态。
 - `owner/*`——排除该 owner 名下所有仓库。
+- 通配符：含 `*` 的模式对完整 `owner/repo` 字符串匹配——`*vpn*`（子串）、`nvidia*`（前缀）、
+  `*vpn`（后缀）；不区分大小写。写坏的模式只会被跳过，不会致命。
 
 **语义**
 
