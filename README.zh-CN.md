@@ -145,7 +145,7 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 - **选取是轮换而非打穿单个贡献者**：优先剩余额度最高的 token，但评分加 ±250 抖动
   （相对 5000 的额度微不足道）。额度相近的 token 因此轮流出勤；严格取最大会把每个
   请求都压在恰好排在首位的那个人身上。
-- **使用次数与剩余次数对称**：每次代理请求把中选 token 本地已知的 `remaining` 减一，
+- **使用次数与剩余次数对称**：每次服务请求把中选 token 本地已知的 `remaining` 减一，
   两次 GitHub 验活之间不会出现「调用 1200 次、还剩 4900」这种自相矛盾的表格。
 - **`GET /api/token/stats`** 返回池的脱敏统计（login / 使用次数 / 最后已知的剩余额度 /
   状态）与存储用量（记录数 / 估算字节），供贡献者页与首页展示；不含 token 明文。
@@ -175,6 +175,38 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 | 响应头 | 剥离逐跳头，附加 CORS，其余透传 |
 | 响应体 | 逐字节流式透传；可缓存的 release 资产（≤ 4MB 的完整请求）整体缓冲、写入 Blob 后再回传 |
 
+## 返回码速查
+
+所有 JSON 错误响应统一为 `{"error":"<code>"}` 并带 CORS 头；成功响应逐字节透传自 GitHub
+（或由 Blob 缓存直接回源）。所有门禁拒绝刻意共用同一个响应体——服务不透露具体是哪道门拦的。
+
+### 服务请求（`/https://…`）
+
+| 状态码 | 含义 | 产生方 |
+|---|---|---|
+| 200 | 成功，完整 body。缓存命中同样是 200——`x-cache: HIT` / `MISS` 头区分来源 | 服务 / 上游 |
+| 204 | CORS 预检（`OPTIONS`） | 服务 |
+| 206 | `Range` 断点续传的部分内容 | 透传 |
+| 403 | `{"error":"not allowed"}`——以下之一：UA 门禁未过（UA 不含 `HomeAssistant`）、目标域名不在 7 域名白名单、仓库命中 `blocked_repos`、严格模式下仓库不在 `allow_repos`、文件类型黑名单命中、GitHub 自身的权限 403（原样透传） | 门禁 / 上游 |
+| 404 | `{"error":"not found"}`——GitHub 判定仓库 / 分支 / 文件不存在（原样透传）；或服务路径且无匹配静态页 | 上游 / 服务 |
+| 429 | `{"error":"too many requests"}`——每 IP 限流（600 次 / 时），或共享池重试后 GitHub 配额仍然耗尽（透传） | 服务 / 上游 |
+| 500 | 仅诊断用——请求带 `x-diag: 1` 头时返回真实错误信息（临时手段，后续移除） | 服务 |
+| 502 | `{"error":"upstream error"}`——上游请求失败、重定向跳出白名单、或未捕获的内部错误（所有异常都收拢到这里） | 服务 |
+| 545 | EdgeOne 的不透明「script error」。正常情况下不该出现——所有 handler 错误都会映射为 502；若见到即为平台级问题（冷启动 / 打包），与客户端无关 | 平台 |
+
+其余上游状态码原样透传（301/302 在内部由重定向处理器消费，客户端不会直接看到）。
+
+### 辅助端点
+
+| 端点 | 成功 | 错误 |
+|---|---|---|
+| `POST /share/device/start` | `200 {user_code, verification_uri, expires_in, interval}` | `403 not allowed`（缺 host 头）· `429 too many requests`（start 限流）· `502 upstream error` · `503 service unavailable`（OAuth 应用未配置） |
+| `POST /share/device/poll` | `200 {status: pending \| ok \| expired \| denied}`——`ok` 附带 `login` / `avatar_url` / `stored`；中间态标记：`slow_down`、`storing`、`reused` | `403 not allowed` · `404 not found`（session 格式非法）· `502 upstream error` / `storage unavailable` · `503 service unavailable` |
+| `GET /api/token/stats` | `200` 脱敏共享池统计（无任何 token 明文） | `502 {"error":"kv error"}` |
+
+`/https://…` 前缀之外的路径回落到静态页面（首页 / 贡献者 / 共享 Token）；无匹配页面时返回
+`404 {"error":"not found"}`。
+
 ## 请求要求
 
 - 请求头 `User-Agent` 必须包含 `HomeAssistantMarketplace` 或 `HomeAssistant`
@@ -200,6 +232,8 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 
 - `owner/repo`——排除该仓库的全部请求形态。
 - `owner/*`——排除该 owner 名下所有仓库。
+- 通配符：含 `*` 的模式对完整 `owner/repo` 字符串匹配——`*vpn*`（子串）、`nvidia*`（前缀）、
+  `*vpn`（后缀）；不区分大小写。写坏的模式只会被跳过，不会致命。
 
 **语义**
 
@@ -238,7 +272,7 @@ release 资产缓存使用 EdgeOne Pages Blob：store 名 `github-cache`，与 K
 - [x] Device Flow 成功后接入 KV 池入库（按 login 去重，重复分享原地更新 token；Device Flow 会话同样迁入 KV，跨 isolate 可靠）
 - [x] `GET /api/token/stats` —— 贡献者页的脱敏池统计（login / 使用次数 / 剩余额度 / 状态，无 token 明文）
 - [x] release 资产 Blob 缓存：SHA-256 键的 `meta`/`body` 双键、二进制精确读写、响应前写入、只缓存 ≤ 4MB 的完整请求、按文件数自动淘汰最老项，纯加速层不影响正确性
-- [x] 共享 token 加权轮换——额度相近的 token 轮流出勤，不再由单个贡献者吸收全部流量；每次代理请求同步扣减该 token 本地已知的剩余额度
+- [x] 共享 token 加权轮换——额度相近的 token 轮流出勤，不再由单个贡献者吸收全部流量；每次服务请求同步扣减该 token 本地已知的剩余额度
 - [x] Device Flow 入库保证——写入重试 + 回读校验，失败时保留会话并重新入库，绝不把还能落盘的授权报成失败
 - [x] 控制台可编辑的仓库排除名单——KV 键 `blocked_repos`，支持 `owner/repo` 与 `owner/*`，在上游调用前 403，60 秒缓存，键缺失/损坏安全降级
 - [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复（暂缓）
