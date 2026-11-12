@@ -283,11 +283,22 @@ export async function pickTokenRecord(kvb, excludeTokens) {
   best.rec.use_count = (best.rec.use_count || 0) + 1;
   // Each proxied request consumes exactly one unit of the picked token's core quota:
   // decrement the locally known remaining so the table (uses vs remaining) stays
-  // consistent between GitHub's own /rate_limit snapshots. / 每次代理请求恰好消耗
+  // consistent between GitHub's own /rate_limit snapshots. / 每次服务请求恰好消耗
   // 中选 token 的 1 个核心配额：同步把本地已知的 remaining 减一，让「使用次数」与
   // 「剩余次数」在两次 GitHub 验活之间保持一致。
   if (typeof best.rec.remaining === 'number' && best.rec.remaining > 0) {
     best.rec.remaining -= 1;
+  }
+  // Hourly window bookkeeping / 小时窗记账：
+  // use_count is the CURRENT hourly-window call count, not a lifetime counter.
+  // GitHub resets the core quota at the hour boundary; when the stored window has
+  // rolled over (reset_at passed, or first ever pick), the count restarts at 1.
+  // GitHub 的配额在小时边界重置；检测到窗口翻篇（reset_at 已过 / 首次取用）时，
+  // 计数从 1 重新开始，与「本小时剩余」保持同一个时间窗。
+  const windowId = best.rec.reset_at || 0;
+  if (!best.rec.window_at || best.rec.window_at !== windowId) {
+    best.rec.window_at = windowId; // remember which window this count belongs to / 记住计数属于哪个窗口
+    best.rec.use_count = 1;
   }
   best.rec.updated_at = nowStr();
   await kvb.put(best.key, JSON.stringify(best.rec));
@@ -328,6 +339,7 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
       created_at: (prev && prev.created_at) || now,
       updated_at: now,
       use_count: (prev && prev.use_count) || 0,
+      window_at: (prev && prev.window_at) || 0, // hourly-window id the count belongs to / 计数所属的小时窗标识
       remaining: 0,
       checked_at: 0, // force revalidation on next pick / 下次选取强制验活
       // prev.disabled deliberately NOT carried: a re-share revives / 刻意不带 disabled：重分享即复活

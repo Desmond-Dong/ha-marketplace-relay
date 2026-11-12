@@ -88,6 +88,14 @@ export async function getPoolStats(env) {
         // ok or exhausted: both carry a real remaining number (0 = used up, recovers
         // at reset). / ok 或 exhausted：都带真实的 remaining 数值（0 = 已用尽，重置后恢复）。
         e.rec.remaining = v.remaining;
+        // Refresh the call count at the same moment, same window: when GitHub's new
+        // reset point shows the quota has rolled over, the count restarts at 0.
+        // 调用数在同一时刻、同一窗口刷新：GitHub 返回的新重置点说明配额已翻篇时，
+        // 计数同步归零（由 pick 在新窗口首次请求时从 1 开始）。
+        if (e.rec.window_at !== (v.resetAt || 0)) {
+          e.rec.window_at = v.resetAt || 0;
+          e.rec.use_count = 0;
+        }
         e.rec.checked_at = Date.now();
         e.rec.reset_at = v.resetAt || 0;
         e.rec.updated_at = nowStr();
@@ -109,6 +117,9 @@ export async function getPoolStats(env) {
         // 已耗尽如实显示 0（重置后恢复）；从未验活的保持空白。
         return {
           login: e.rec.login || 'anonymous',
+          // use_count is the CURRENT hourly-window count (reset together with the
+          // quota), not a lifetime total. / use_count 是当前小时窗的调用数（与配额
+          // 同步重置），不是终身累计。
           use_count: e.rec.use_count || 0,
           // Last-known value, however old — never hidden and never probed on read.
           // 最后一次已知值，不因过期而隐藏，也不为读它发起探测。
