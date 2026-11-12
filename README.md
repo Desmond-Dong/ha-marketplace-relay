@@ -166,9 +166,10 @@ hand, no size accounting to drift.
   every request on whoever happens to be at the top.
 - **Uses and remaining share one hourly window.** Every proxied request decrements the
   picked token's locally known `remaining` by one. `use_count` counts only the CURRENT
-  hourly window: when GitHub resets the quota at the hour boundary the count restarts,
-  so `use_count + remaining` is always ≤ 5,000 (the gap is other tools using the same
-  token outside this service).
+  hourly window: when GitHub resets the quota at the hour boundary the count restarts.
+  "Remaining" is GitHub's real balance and includes the token's usage outside this
+  service, so `use_count + remaining` may be less than 5,000 — the gap is exactly that
+  external consumption.
 - **`GET /api/token/stats`** returns masked pool stats (login / hourly call count / last-known
   remaining quota / status) plus storage usage (record count / approximate bytes) for
   the contributors page and the home page. No raw tokens. `remaining` is refreshed by a
