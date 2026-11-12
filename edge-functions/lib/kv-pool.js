@@ -339,6 +339,7 @@ export async function insertPoolRecord(kvb, { token, login, avatar_url }) {
       created_at: (prev && prev.created_at) || now,
       updated_at: now,
       use_count: (prev && prev.use_count) || 0,
+      window_at: (prev && prev.window_at) || 0, // hourly-window id the count belongs to / 计数所属的小时窗标识
       remaining: 0,
       checked_at: 0, // force revalidation on next pick / 下次选取强制验活
       // prev.disabled deliberately NOT carried: a re-share revives / 刻意不带 disabled：重分享即复活
