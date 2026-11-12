@@ -109,6 +109,9 @@ export async function getPoolStats(env) {
         // 已耗尽如实显示 0（重置后恢复）；从未验活的保持空白。
         return {
           login: e.rec.login || 'anonymous',
+          // use_count is the CURRENT hourly-window count (reset together with the
+          // quota), not a lifetime total. / use_count 是当前小时窗的调用数（与配额
+          // 同步重置），不是终身累计。
           use_count: e.rec.use_count || 0,
           // Last-known value, however old — never hidden and never probed on read.
           // 最后一次已知值，不因过期而隐藏，也不为读它发起探测。

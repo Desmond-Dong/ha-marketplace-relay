@@ -164,10 +164,12 @@ hand, no size accounting to drift.
   remaining quota is preferred, but the score is jittered by ±250 (negligible against a
   5,000 quota). Near-equal tokens therefore take turns; a strict max would concentrate
   every request on whoever happens to be at the top.
-- **Uses and remaining stay symmetric.** Every proxied request decrements the picked
-  token's locally known `remaining` by one, so the contributors table does not show
-  "1,200 calls but 4,900 left" between two GitHub snapshots.
-- **`GET /api/token/stats`** returns masked pool stats (login / use count / last-known
+- **Uses and remaining share one hourly window.** Every proxied request decrements the
+  picked token's locally known `remaining` by one. `use_count` counts only the CURRENT
+  hourly window: when GitHub resets the quota at the hour boundary the count restarts,
+  so `use_count + remaining` is always ≤ 5,000 (the gap is other tools using the same
+  token outside this service).
+- **`GET /api/token/stats`** returns masked pool stats (login / hourly call count / last-known
   remaining quota / status) plus storage usage (record count / approximate bytes) for
   the contributors page and the home page. No raw tokens. `remaining` is refreshed by a
   **bounded proactive revalidation**: records stale for more than 10 minutes are probed
