@@ -91,6 +91,12 @@ nav a.primary .btn-en { color: rgba(255,255,255,.8); }
 .privacy ul { margin: 12px 0 4px; padding-left: 20px; }
 .privacy li { margin: 10px 0; line-height: 1.8; font-size: 14px; color: #57606a; }
 .privacy li .en { display: block; font-size: 12px; color: #8b949e; line-height: 1.7; margin-top: 3px; }
+/* Quota impact callout: highlighted inside the privacy block (strong color + tinted
+   background) so contributors see the 5,000/h story before sharing. */
+/* 额度影响提示：在声明块内高亮（加重色 + 浅色底），共享前先看清 5000/h 的事 */
+.privacy li.quota-impact { background: #fff0f0; border-left: 3px solid #cf222e; padding: 10px 12px; border-radius: 6px; }
+.privacy li.quota-impact > b { color: #cf222e; }
+.privacy li.quota-impact .en > b { color: #cf222e; }
 
 button { width: 100%; padding: 12px; font-size: 15px; border: 0; border-radius: 8px; background: #1a7f37; color: #fff; cursor: pointer; margin-top: 8px; }
 button:hover { background: #146c2e; }
