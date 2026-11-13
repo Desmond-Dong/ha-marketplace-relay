@@ -9,7 +9,7 @@ const STORE_NAME = "github-cache";
 // 双阈值淘汰：条数与总字节数。list() 不返回大小，写入时把 content-length 记进 meta，
 // 淘汰时汇总计算。
 const MAX_FILES = 50;
-const MAX_TOTAL_BYTES = 200 * 1024 * 1024; // 200 MB cap / 200MB 空间上限（免费额度 1GB）
+const MAX_TOTAL_BYTES = 500 * 1024 * 1024; // 500 MB cap / 500MB 空间上限（额度 1GB 的一半）
 
 // 生成缓存 hash：URL 的 SHA-256
 async function urlHash(url) {
