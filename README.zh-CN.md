@@ -284,7 +284,7 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 | `device/<session>` | KV 记录 | Device Flow 会话（跨 isolate 存活，短时效） |
 | `blocked_repos` | KV JSON 数组 | 恒拒绝名单（模式匹配，支持通配符） |
 | `allow_repos` | KV JSON 数组 | 严格模式白名单；空 = 全放行 |
-| `body/<sha256>` + `meta/<sha256>` | Blob 键对 | release 资产缓存（单条 ≤ 4MB，上限 50 条） |
+| `body/<sha256>` + `meta/<sha256>` | Blob 键对 | release 资产缓存（单条 ≤ 4MB，双阈值上限：300 条 / 500MB 总量） |
 | `KV_QUOTA_MB`（环境变量） | 数字 | 可选；开启首页存储用量百分比显示 |
 
 1. 在 EdgeOne Makers 连接本仓库，加速区域选「全球可用区（含中国大陆）」
@@ -302,7 +302,7 @@ KV 池使用 EdgeOne Pages KV：命名空间 `marketplace`，绑定变量名同�
 
 release 资产缓存使用 EdgeOne Pages Blob：store 名 `github-cache`，与 KV 在同一处
 创建并绑定（Blob 通过 `getStore("github-cache")` 访问，不走环境变量也不走全局）。
-键、体积、过期都无需手工配置：store 最多保留 50 条，写入时自动淘汰最老项。
+键、体积、过期都无需手工配置：store 双阈值自动淘汰——条数 ≤300 且总量 ≤500MB，超出时写入前先淘汰最老项。
 `@edgeone/pages-blob` 是 npm 依赖（`^0.0.18`），必须以**静态顶层 import** 引入——
 在请求路径里用动态 `import()` 会让整个边缘函数崩溃，表现为全站 545 而不是缓存未命中。
 

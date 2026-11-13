@@ -328,7 +328,7 @@ closed catalog.
 | `device/<session>` | KV records | Device Flow sessions (cross-isolate, short-lived) |
 | `blocked_repos` | KV JSON array | Repos always rejected (patterns, wildcards supported) |
 | `allow_repos` | KV JSON array | Strict-mode allowlist; empty = allow all |
-| `body/<sha256>` + `meta/<sha256>` | Blob pairs | Release-asset cache (≤ 4 MB entries, 50-entry cap) |
+| `body/<sha256>` + `meta/<sha256>` | Blob pairs | Release-asset cache (≤ 4 MB entries, 300-entry / 500 MB dual cap) |
 | `KV_QUOTA_MB` (env var) | number | Optional; enables the percentage display on the home page |
 
 1. Connect this repository to EdgeOne Makers, acceleration region: "Global (including Chinese mainland)"
@@ -347,7 +347,7 @@ storage usage as a percentage; without it only absolute usage is shown.
 The release-asset cache uses EdgeOne Pages Blob, store name `github-cache`, created and
 bound in the same place as KV (Blob is read through `getStore("github-cache")`, not
 through an env var or a global). No manual provisioning of keys, sizes or expiry: the
-store keeps at most 50 entries and evicts the oldest on write. `@edgeone/pages-blob` is
+store keeps at most 300 entries and 500 MB in total, evicting the oldest until both are back within the caps. `@edgeone/pages-blob` is
 an npm dependency (`^0.0.18`) and must be a **static top-level import** — a dynamic
 `import()` inside the request path crashes the whole edge function, which surfaces as a
 site-wide 545 rather than a cache miss.

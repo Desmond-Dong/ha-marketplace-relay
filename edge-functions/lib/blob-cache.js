@@ -8,7 +8,7 @@ const STORE_NAME = "github-cache";
 // so setCached records the content length in each meta entry and eviction sums it up.
 // 双阈值淘汰：条数与总字节数。list() 不返回大小，写入时把 content-length 记进 meta，
 // 淘汰时汇总计算。
-const MAX_FILES = 50;
+const MAX_FILES = 300;
 const MAX_TOTAL_BYTES = 500 * 1024 * 1024; // 500 MB cap / 500MB 空间上限（额度 1GB 的一半）
 
 // 生成缓存 hash：URL 的 SHA-256
