@@ -454,11 +454,32 @@ async function handleRequestInner(context) {
       resHeaders.set(k, v);
     }
   }
-  // We stripped content-encoding (edge re-compresses); set a safe content-type by status.
-  // Body was decoded by fetch, so no binary/charset mismatch can leak through.
-  // content-type 已随 content-encoding 一并剥离（fetch 已解压 body），按状态码重置，避免边缘对解码后的 body 误判
+  // We stripped content-encoding (edge re-compresses), so the upstream content-type is
+  // gone with it. Re-derive it instead of defaulting everything to octet-stream:
+  // HACS's aiogithubapi only parses JSON when content-type says JSON — with a plain
+  // octet-stream label it hands back a string and every repos.get()/releases.list()
+  // crashes with "'str' object has no attribute 'items'". The API responses are JSON;
+  // HTML pages are text/html; binary downloads keep the octet-stream fallback.
+  // content-type 已随 content-encoding 一并剥离（fetch 解压后 charset 参数可能与字节不符）。
+  // 不能全部回填 octet-stream：HACS 的 aiogithubapi 只在 content-type 为 JSON 时才解析，
+  // 否则把 body 当纯文本返回，repos.get()/releases.list() 直接抛
+  // "'str' object has no attribute 'items'"。API 响应回填 JSON、HTML 回填 text/html，
+  // 其余二进制下载维持 octet-stream 兜底。
   if (!resHeaders.has('content-type')) {
-    resHeaders.set('content-type', upstream.status < 400 ? 'application/octet-stream' : 'text/plain');
+    let ct;
+    if (target.hostname === 'api.github.com') {
+      ct = 'application/json; charset=utf-8';
+    } else {
+      const upstreamCt = (upstream.headers.get('content-type') || '').toLowerCase();
+      if (upstreamCt.includes('text/html')) {
+        ct = 'text/html; charset=utf-8';
+      } else if (upstreamCt.includes('application/json')) {
+        ct = 'application/json; charset=utf-8';
+      } else {
+        ct = upstream.status < 400 ? 'application/octet-stream' : 'text/plain';
+      }
+    }
+    resHeaders.set('content-type', ct);
   }
   withCors(resHeaders);
 
