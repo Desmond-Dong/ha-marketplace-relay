@@ -88,18 +88,21 @@ async function evictIfNeeded(store) {
     // 列出所有元数据
     const { blobs } = await store.list({ prefix: "meta/" });
     
-    // 读取所有元数据并解析时间戳
-    const metas = [];
-    for (const blob of blobs) {
-      try {
-        const meta = await store.get(blob.key, { type: "json" });
-        if (meta) {
-          metas.push({ ...meta, key: blob.key });
-        }
-      } catch (e) {
-        // 跳过损坏的元数据（体积按 0 计）
-      }
-    }
+    // 读取所有元数据并解析时间戳。并行读：条数上限 300 后串行 await 会把本次
+    // MISS 写入的墙钟时间线性放大（300 × 单次 RTT），并行后压到一轮 RTT。
+    // CPU 不变（同样一批 JSON.parse），Blob 读取属 I/O 等待，不计入函数 CPU 时间。
+    const metas = (
+      await Promise.all(
+        blobs.map(async (blob) => {
+          try {
+            const meta = await store.get(blob.key, { type: "json" });
+            return meta ? { ...meta, key: blob.key } : null;
+          } catch (e) {
+            return null; // 跳过损坏的元数据（体积按 0 计）
+          }
+        })
+      )
+    ).filter(Boolean);
     
     // 双阈值判定：条数与总字节数任一超限都需要淘汰
     let totalBytes = 0;
@@ -109,22 +112,28 @@ async function evictIfNeeded(store) {
     // 按时间戳排序（最老的在前）
     metas.sort((a, b) => a.timestamp - b.timestamp);
     
-    // 从最老开始删，直到条数与空间双双回到阈值内
+    // 从最老开始删，直到条数与空间双双回到阈值内。并行删：与并行读同理，
+    // 单轮删光超额项，避免串行删除拖长本次写入。
     let i = 0;
+    const doomed = [];
     while (i < metas.length && (metas.length - i > MAX_FILES || totalBytes > MAX_TOTAL_BYTES)) {
       const meta = metas[i];
       totalBytes -= meta.size || 0;
       i++;
-      try {
-        const hash = meta.key.replace(/^meta\//, "");
-        // 删除元数据
-        await store.delete(meta.key);
-        // 删除缓存体
-        await store.delete(`body/${hash}`);
-      } catch (e) {
-        // 删除失败，跳过
-      }
+      doomed.push(meta);
     }
+    await Promise.all(
+      doomed.map(async (meta) => {
+        try {
+          const hash = meta.key.replace(/^meta\//, "");
+          // 删除元数据与缓存体
+          await store.delete(meta.key);
+          await store.delete(`body/${hash}`);
+        } catch (e) {
+          // 删除失败，跳过
+        }
+      })
+    );
   } catch (e) {
     // 淘汰失败不影响主流程
   }
