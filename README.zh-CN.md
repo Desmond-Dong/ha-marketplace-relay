@@ -12,6 +12,18 @@ https://<your-domain>/https://github.com/owner/repo/releases/download/v1.0.0/ass
 https://<your-domain>/https://raw.githubusercontent.com/owner/repo/main/file.txt
 ```
 
+**支持的 URL 形态**
+
+| 上游 | 处理方式 |
+|---|---|
+| `api.github.com/…` | 原样透传；附共享池 token；响应回标 `application/json` |
+| `github.com/<o>/<r>/releases/download/…` | 重定向到资产 CDN；小资产走 Blob 缓存 |
+| `github.com/<o>/<r>/archive/…`（经 codeload 的源码包） | 匿名透传 |
+| `raw.githubusercontent.com/<o>/<r>/<ref>/<path>` | 重映射到官方 Contents API（同字节，`application/vnd.github.raw`） |
+| `objects` / `release-assets.githubusercontent.com` | 资产 CDN 跳转，逐跳白名单校验 |
+
+**响应 content-type**。服务会在出口重新标注：API/JSON 响应标 `application/json; charset=utf-8`，HTML 页面标 `text/html; charset=utf-8`，二进制下载维持 `application/octet-stream`。这不是可选项：HACS 的 aiogithubapi 只在头标为 JSON 时才按 JSON 解析——标签错了 API 响应会被当成纯文本，`repos.get()` / `releases.list()` 直接抛 `AttributeError: 'str' object has no attribute 'items'`（2026.11 版修复）。
+
 ## 请求流程 / 从请求到响应
 
 ```
@@ -174,7 +186,7 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 | 查询参数 | 原样透传（内层 URL 的查询参数随外层请求传递） |
 | 请求体 | 流式透传，不做修改 |
 | 响应状态码 | 原样透传 |
-| 响应头 | 剥离逐跳头，附加 CORS，其余透传 |
+| 响应头 | 剥离逐跳头，附加 CORS；`content-type` 按类型回填（API → `application/json`，HTML → `text/html`，二进制 → `application/octet-stream`），其余透传 |
 | 响应体 | 逐字节流式透传；可缓存的 release 资产（≤ 4MB 的完整请求）整体缓冲、写入 Blob 后再回传 |
 
 ## 返回码速查
@@ -246,7 +258,34 @@ store 名 `github-cache`，上限 `MAX_FILES = 50`。每次写入前列出 `meta
 - 检查发生在缓存查询与任何上游跳之前：被排除仓库不产生任何上游流量。
 - 想恢复某仓库，删除对应条目（或整个键）即可，同样 60 秒内生效。
 
+### 仓库白名单 / Repo allowlist
+
+第二个 KV 键可以把服务切进严格模式：
+
+- **键**：`marketplace` KV 命名空间里的 `allow_repos`
+- **值**：JSON 数组，模式形态与黑名单相同（`owner/repo`、`owner/*`、通配符）
+
+**语义**
+
+- **空、缺失或格式非法 = 全放行**（默认）。严格模式是主动开启的：写入非空列表即开启，清空即关闭。
+- **非空 = 只放行名单内仓库。**其余仓库在任何上游调用之前即被 403 拒绝。
+- **`blocked_repos` 恒优先。**同时命中两份名单的仓库会被拒绝——排除名单是任何白名单条目都无法越过的安全网。
+- 60 秒缓存与安全降级规则与黑名单相同；两份名单在同一次组合判定里一起校验。
+
+典型用法：平时 `allow_repos` 留空，靠黑名单挡已知的坏仓库；哪天违规规模超出追名单的精力，把想服务的仓库（比如 `hacs/default` 里的全部）填进 `allow_repos`，服务即变成封闭目录。
+
 ## 部署
+
+**KV 与存储总表**——服务存储的全部键位（命名空间 `marketplace`、Blob store `github-cache`，均在 EdgeOne 控制台绑定）：
+
+| 键 / 存储 | 类型 | 用途 |
+|---|---|---|
+| `pool/<hash>` | KV 记录 | 共享 token 池（每位贡献者一条；`/api/token/stats` 只出脱敏字段） |
+| `device/<session>` | KV 记录 | Device Flow 会话（跨 isolate 存活，短时效） |
+| `blocked_repos` | KV JSON 数组 | 恒拒绝名单（模式匹配，支持通配符） |
+| `allow_repos` | KV JSON 数组 | 严格模式白名单；空 = 全放行 |
+| `body/<sha256>` + `meta/<sha256>` | Blob 键对 | release 资产缓存（单条 ≤ 4MB，双阈值上限：300 条 / 500MB 总量） |
+| `KV_QUOTA_MB`（环境变量） | 数字 | 可选；开启首页存储用量百分比显示 |
 
 1. 在 EdgeOne Makers 连接本仓库，加速区域选「全球可用区（含中国大陆）」
 2. 构建命令留空，输出目录 `public`
@@ -263,9 +302,18 @@ KV 池使用 EdgeOne Pages KV：命名空间 `marketplace`，绑定变量名同�
 
 release 资产缓存使用 EdgeOne Pages Blob：store 名 `github-cache`，与 KV 在同一处
 创建并绑定（Blob 通过 `getStore("github-cache")` 访问，不走环境变量也不走全局）。
-键、体积、过期都无需手工配置：store 最多保留 50 条，写入时自动淘汰最老项。
+键、体积、过期都无需手工配置：store 双阈值自动淘汰——条数 ≤300 且总量 ≤500MB，超出时写入前先淘汰最老项。
 `@edgeone/pages-blob` 是 npm 依赖（`^0.0.18`），必须以**静态顶层 import** 引入——
 在请求路径里用动态 `import()` 会让整个边缘函数崩溃，表现为全站 545 而不是缓存未命中。
+
+## 页面合规配置 / Page compliance features
+
+静态页面内置了面向中国大陆的合规配置（部署在境外的 fork 可按需移除）：
+
+- **首页合规声明**：内容不符合中国法律法规的集成将被阻止中继；服务端由 `blocked_repos` 执行。
+- **`robots.txt`**（`Disallow: /`）+ 三页 `noindex, nofollow, noarchive, nosnippet` meta——要求搜索引擎不爬取、不收录。
+- **每页备案 footer**：ICP 备案号（链 beian.miit.gov.cn）与公网安备（链 beian.gov.cn），居中置于卡片下方。
+- **违规举报链接**：同在 footer，`mailto:` 运营者举报邮箱，主题预填。
 
 ## 规划
 
@@ -276,7 +324,10 @@ release 资产缓存使用 EdgeOne Pages Blob：store 名 `github-cache`，与 K
 - [x] release 资产 Blob 缓存：SHA-256 键的 `meta`/`body` 双键、二进制精确读写、响应前写入、只缓存 ≤ 4MB 的完整请求、按文件数自动淘汰最老项，纯加速层不影响正确性
 - [x] 共享 token 加权轮换——额度相近的 token 轮流出勤，不再由单个贡献者吸收全部流量；每次服务请求同步扣减该 token 本地已知的剩余额度
 - [x] Device Flow 入库保证——写入重试 + 回读校验，失败时保留会话并重新入库，绝不把还能落盘的授权报成失败
-- [x] 控制台可编辑的仓库排除名单——KV 键 `blocked_repos`，支持 `owner/repo` 与 `owner/*`，在上游调用前 403，60 秒缓存，键缺失/损坏安全降级
+- [x] 控制台可编辑的仓库排除名单——KV 键 `blocked_repos`，模式（`owner/repo`、`owner/*`、`*vpn*` 通配符），在上游调用前 403，60 秒缓存，键缺失/损坏安全降级
+- [x] 可选的严格白名单模式——KV 键 `allow_repos`；非空 = 只放行名单内仓库，空 = 全放行；`blocked_repos` 恒优先
+- [x] 小时窗用量统计——贡献者表展示当前小时窗的调用数与剩余数（随 GitHub 配额同步重置），两数直接可比
+- [x] 正确的响应 content-type——API 响应回标 `application/json`（兼容 aiogithubapi）、HTML 标 `text/html`、二进制维持 `application/octet-stream`
 - [ ] 管理端点 `export` / `import`（AdminKey 鉴权），用于 KV 备份与恢复（暂缓）
 
 ## README

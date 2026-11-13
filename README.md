@@ -12,6 +12,23 @@ https://<your-domain>/https://github.com/owner/repo/releases/download/v1.0.0/ass
 https://<your-domain>/https://raw.githubusercontent.com/owner/repo/main/file.txt
 ```
 
+**Supported URL forms**
+
+| Upstream | Handled as |
+|---|---|
+| `api.github.com/…` | Passed through; shared-pool token attached; response relabeled `application/json` |
+| `github.com/<o>/<r>/releases/download/…` | Redirected to the asset CDN; small assets served from Blob cache |
+| `github.com/<o>/<r>/archive/…` (source archives via codeload) | Passed through anonymously |
+| `raw.githubusercontent.com/<o>/<r>/<ref>/<path>` | Remapped to the official Contents API (same bytes, `application/vnd.github.raw`) |
+| `objects` / `release-assets.githubusercontent.com` | Asset CDN hops, allowlist-checked |
+
+**Response content-types.** The service relabels responses on the way out: API/JSON
+responses carry `application/json; charset=utf-8`, HTML pages `text/html; charset=utf-8`,
+binary downloads stay `application/octet-stream`. This is load-bearing: HACS's
+aiogithubapi only parses JSON when the header says JSON — a mislabeled API response made
+`repos.get()` / `releases.list()` crash with `AttributeError: 'str' object has no
+attribute 'items'` (fixed in v2026.11).
+
 ## How a request flows / Request pipeline
 
 ```
@@ -200,7 +217,7 @@ hand, no size accounting to drift.
 | Query string | Passed through (the outer request's search rides on the inner URL) |
 | Request body | Streamed through unchanged |
 | Response status | Passed through unchanged |
-| Response headers | Hop-by-hop stripped; CORS added; the rest passed through |
+| Response headers | Hop-by-hop stripped; CORS added; `content-type` re-derived (API → `application/json`, HTML → `text/html`, binaries → `application/octet-stream`); the rest passed through |
 | Response body | Streamed through byte-for-byte; cacheable release assets (≤ 4 MB, full requests) are buffered, written to Blob, then returned |
 
 ## Response codes
@@ -277,7 +294,42 @@ for that repo. The list lives in KV, so you edit it in the console, no redeploy:
 - To stop blocking a repo, remove the entry (or the whole key) — again effective within
   60 seconds.
 
+### Repo allowlist / 仓库白名单
+
+The second KV key flips the service into strict mode:
+
+- **Key**: `allow_repos` in the `marketplace` KV namespace
+- **Value**: a JSON array of the same pattern forms (`owner/repo`, `owner/*`, wildcards)
+
+**Semantics**
+
+- **Empty, missing, or malformed = allow everything** (the default). Strict mode is
+  opt-in: you switch it on by writing a non-empty list, and back off by clearing the key.
+- **Non-empty = only listed repos are served.** Everything else gets 403 before any
+  upstream call.
+- **`blocked_repos` always wins.** A repo on both lists is rejected — the exclusion list
+  is the safety net that no allowlist entry can override.
+- Same 60-second cache and safe-degrade rules as the blocklist; the two lists are checked
+  together in one combined gate.
+
+Typical use: leave `allow_repos` empty while the blocklist keeps known-bad repos out;
+if abuse ever scales beyond blocklist chasing, fill `allow_repos` with the repos you
+actually want to serve (e.g. everything from `hacs/default`) and the service becomes a
+closed catalog.
+
 ## Deployment
+
+**KV & storage reference** — everything the service stores, in one place
+(namespace `marketplace`, Blob store `github-cache`, both bound in the EdgeOne console):
+
+| Key / Store | Type | Purpose |
+|---|---|---|
+| `pool/<hash>` | KV records | Shared token pool (one record per contributor; masked in `/api/token/stats`) |
+| `device/<session>` | KV records | Device Flow sessions (cross-isolate, short-lived) |
+| `blocked_repos` | KV JSON array | Repos always rejected (patterns, wildcards supported) |
+| `allow_repos` | KV JSON array | Strict-mode allowlist; empty = allow all |
+| `body/<sha256>` + `meta/<sha256>` | Blob pairs | Release-asset cache (≤ 4 MB entries, 300-entry / 500 MB dual cap) |
+| `KV_QUOTA_MB` (env var) | number | Optional; enables the percentage display on the home page |
 
 1. Connect this repository to EdgeOne Makers, acceleration region: "Global (including Chinese mainland)"
 2. Leave the build command empty; output directory: `public`
@@ -295,10 +347,24 @@ storage usage as a percentage; without it only absolute usage is shown.
 The release-asset cache uses EdgeOne Pages Blob, store name `github-cache`, created and
 bound in the same place as KV (Blob is read through `getStore("github-cache")`, not
 through an env var or a global). No manual provisioning of keys, sizes or expiry: the
-store keeps at most 50 entries and evicts the oldest on write. `@edgeone/pages-blob` is
+store keeps at most 300 entries and 500 MB in total, evicting the oldest until both are back within the caps. `@edgeone/pages-blob` is
 an npm dependency (`^0.0.18`) and must be a **static top-level import** — a dynamic
 `import()` inside the request path crashes the whole edge function, which surfaces as a
 site-wide 545 rather than a cache miss.
+
+## Page compliance features / 页面合规配置
+
+The static pages ship with mainland-China compliance built in (forks deploying elsewhere
+can remove what they do not need):
+
+- **Compliance notice** on the home page: repos whose content violates Chinese laws and
+  regulations are blocked from relaying; enforced server-side by `blocked_repos`.
+- **`robots.txt`** (`Disallow: /`) plus `noindex, nofollow, noarchive, nosnippet` meta on
+  all three pages — search engines are asked not to crawl or index anything.
+- **Filing footer** on every page: ICP number (linking to beian.miit.gov.cn) and public
+  security filing (linking to beian.gov.cn), centered below the card.
+- **Violation report link** in the same footer: `mailto:` the operator's report address
+  with a prefilled subject.
 
 ## Roadmap
 
@@ -309,7 +375,10 @@ site-wide 545 rather than a cache miss.
 - [x] Blob cache for release assets: SHA-256 keyed `meta`/`body` pair, binary-exact reads, write-before-respond, full requests ≤ 4 MB only, oldest entries auto-evicted by file count, pure acceleration with no effect on correctness
 - [x] Weighted rotation across pooled tokens — near-equal tokens take turns instead of one contributor absorbing all traffic; every proxied request decrements that token's locally known remaining quota
 - [x] Guaranteed token persistence in the Device Flow — retried writes with read-back verification, session kept and re-inserted on failure, so an authorization is never reported as failed when it could still land
-- [x] Console-editable repo blocklist — KV key `blocked_repos`, `owner/repo` or `owner/*` patterns, 403 before any upstream call, 60 s cache, safe-degrade on missing/broken key
+- [x] Console-editable repo blocklist — KV key `blocked_repos`, patterns (`owner/repo`, `owner/*`, `*vpn*` wildcards), 403 before any upstream call, 60 s cache, safe-degrade on missing/broken key
+- [x] Optional strict allowlist mode — KV key `allow_repos`; non-empty = only listed repos are served, empty = allow all; `blocked_repos` always wins
+- [x] Hourly-window usage stats — contributor table shows calls and remaining for the CURRENT hour window (reset together with GitHub's quota), so the two numbers are directly comparable
+- [x] Correct response content-types — API responses relabeled `application/json` (aiogithubapi compatibility), HTML as `text/html`, binaries keep `application/octet-stream`
 - [ ] Admin endpoints `export` / `import` (AdminKey auth) for KV backup & restore (deferred)
 
 ## README
