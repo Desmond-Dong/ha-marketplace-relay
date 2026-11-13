@@ -24,9 +24,18 @@ const noStoreHeaders = {
   'access-control-allow-origin': '*',
   'cache-control': 'no-store',
 };
+// The stats table is display-only; 60 s of shared caching collapses refresh spam into
+// at most one function invocation per minute per edge PoP. The underlying revalidate
+// window (QUOTA_TTL_MS) is unchanged and independent of this.
+// 统计表仅作展示；60 秒共享缓存把狂刷压缩到「每 PoP 每分钟至多一次函数调用」。
+// 底层验活窗口（QUOTA_TTL_MS）不变且与此互不影响。
+const statsCacheHeaders = {
+  ...noStoreHeaders,
+  'cache-control': 'public, max-age=60',
+};
 
-function json(status, payload) {
-  return new Response(JSON.stringify(payload), { status, headers: { ...noStoreHeaders } });
+function json(status, payload, headers) {
+  return new Response(JSON.stringify(payload), { status, headers: { ...noStoreHeaders, ...(headers || {}) } });
 }
 
 function nowStr() {
@@ -142,7 +151,7 @@ export async function getPoolStats(env) {
       count: contributors.length,
       contributors,
       storage: { records: entries.length, bytes, quota_bytes: quotaBytes },
-    });
+    }, statsCacheHeaders);
   } catch (e) {
     console.error('[stats] kv error', e && e.message);
     return json(502, { error: 'kv error' });

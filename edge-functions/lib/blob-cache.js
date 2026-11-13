@@ -4,7 +4,12 @@
 import { getStore } from "@edgeone/pages-blob";
 
 const STORE_NAME = "github-cache";
-const MAX_FILES = 50; // 最多缓存 50 个文件（按数量淘汰，因为 list 不返回 size）
+// Dual-threshold eviction: entry count AND total bytes. list() does not return sizes,
+// so setCached records the content length in each meta entry and eviction sums it up.
+// 双阈值淘汰：条数与总字节数。list() 不返回大小，写入时把 content-length 记进 meta，
+// 淘汰时汇总计算。
+const MAX_FILES = 50;
+const MAX_TOTAL_BYTES = 200 * 1024 * 1024; // 200 MB cap / 200MB 空间上限（免费额度 1GB）
 
 // 生成缓存 hash：URL 的 SHA-256
 async function urlHash(url) {
@@ -15,7 +20,9 @@ async function urlHash(url) {
   return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// 查找已存在的缓存
+// 查找已存在的缓存。命中时 body 以流返回（stream 类型），调用方直接把它接进
+// Response——省掉整个文件的 arrayBuffer 物化拷贝，这是命中路径上最大的单项 CPU
+// 开销（4MB 拷贝 vs 建立流引用）。找已存在缓存失败时返回 null，走源站。
 export async function findCached(url) {
   try {
     const store = getStore(STORE_NAME);
@@ -26,10 +33,21 @@ export async function findCached(url) {
     const meta = await store.get(metaKey, { type: "json", consistency: "strong" });
     if (!meta) return null;
 
-    // Read body as binary: default type is "text", which corrupts zip bytes
-    // 以二进制读 body：默认 type 是 text，会把 zip 字节解码坏
+    // Read body as a stream (binary-exact; default type "text" corrupts zip bytes).
+    // Streaming skips the full-buffer copy in the function — the single biggest CPU
+    // item on the cache-hit path. Fall back to arrayBuffer if the runtime refuses.
+    // body 以流读取（字节精确；默认 text 会把 zip 字节解码坏）。流式跳过函数内的
+    // 全量缓冲拷贝。运行时不支持时回退 arrayBuffer。
     const bodyKey = `body/${hash}`;
-    const body = await store.get(bodyKey, { type: "arrayBuffer", consistency: "strong" });
+    let body;
+    try {
+      body = await store.get(bodyKey, { type: "stream", consistency: "strong" });
+    } catch (e) {
+      body = null;
+    }
+    if (!body) {
+      body = await store.get(bodyKey, { type: "arrayBuffer", consistency: "strong" });
+    }
     if (!body) return null;
 
     return { body, contentType: meta.contentType };
@@ -48,9 +66,9 @@ export async function setCached(bodyBuffer, contentType, url) {
     // 先淘汰，再写入
     await evictIfNeeded(store);
 
-    // 写入元数据
+    // 写入元数据（记录体积，供按空间淘汰用）
     const metaKey = `meta/${hash}`;
-    const meta = { url, contentType, timestamp: Date.now() };
+    const meta = { url, contentType, timestamp: Date.now(), size: bodyBuffer.byteLength };
     await store.setJSON(metaKey, meta);
 
     // 写入缓存体（ArrayBuffer 才能保持二进制完整）
@@ -64,12 +82,11 @@ export async function setCached(bodyBuffer, contentType, url) {
   }
 }
 
-// 淘汰最老的文件，直到文件数 < 阈值
+// 淘汰最老的条目，直到条数与总空间都回到阈值内
 async function evictIfNeeded(store) {
   try {
     // 列出所有元数据
     const { blobs } = await store.list({ prefix: "meta/" });
-    if (blobs.length <= MAX_FILES) return;
     
     // 读取所有元数据并解析时间戳
     const metas = [];
@@ -80,19 +97,24 @@ async function evictIfNeeded(store) {
           metas.push({ ...meta, key: blob.key });
         }
       } catch (e) {
-        // 跳过损坏的元数据
+        // 跳过损坏的元数据（体积按 0 计）
       }
     }
     
-    if (metas.length <= MAX_FILES) return;
+    // 双阈值判定：条数与总字节数任一超限都需要淘汰
+    let totalBytes = 0;
+    for (const m of metas) totalBytes += m.size || 0;
+    if (metas.length <= MAX_FILES && totalBytes <= MAX_TOTAL_BYTES) return;
     
     // 按时间戳排序（最老的在前）
     metas.sort((a, b) => a.timestamp - b.timestamp);
     
-    // 删除最老的，直到文件数 < 阈值
-    const toDelete = metas.length - MAX_FILES;
-    for (let i = 0; i < toDelete; i++) {
+    // 从最老开始删，直到条数与空间双双回到阈值内
+    let i = 0;
+    while (i < metas.length && (metas.length - i > MAX_FILES || totalBytes > MAX_TOTAL_BYTES)) {
       const meta = metas[i];
+      totalBytes -= meta.size || 0;
+      i++;
       try {
         const hash = meta.key.replace(/^meta\//, "");
         // 删除元数据

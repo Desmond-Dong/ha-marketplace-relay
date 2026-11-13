@@ -21,7 +21,7 @@ export const SESS_PREFIX = 'sess_';
 // Quota freshness window: entries revalidated within this window skip the GitHub
 // /rate_limit round-trip (bounds API calls; see pickTokenRecord).
 // 额度保鲜期：窗口内免走 GitHub /rate_limit（限制 API 调用频次，见 pickTokenRecord）。
-export const QUOTA_TTL_MS = 10 * 60 * 1000;
+export const QUOTA_TTL_MS = 30 * 60 * 1000; // freshness window: 30 min (/rate_limit is quota-free; widening cuts wasted probe rounds by ~2/3) 保鲜窗口 30 分钟（/rate_limit 不计配额；放宽后每条记录的验活频率降约 2/3）
 
 // Resolve the console KV binding / 解析控制台 KV 绑定
 // `marketplace` is the live binding; TOKENPOOL_KV kept as a legacy alias from the
